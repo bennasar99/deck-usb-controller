@@ -1,0 +1,7 @@
+backend/out/
+bin/
+*.log
+__pycache__/
+*.py[cod]
+.vscode/
+*.zip
