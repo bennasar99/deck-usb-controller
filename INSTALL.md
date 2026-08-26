@@ -1,8 +1,13 @@
-# Installing "Steam Deck -> USB Gamepad" on a Steam Deck
+# Installing "Steam Deck -> USB Controller" on a Steam Deck
 
-Turn any Steam Deck into a USB gamepad for a PC. While the app is running the
-Deck's controls are forwarded over its USB-C port to the connected computer as
-a generic HID gamepad, and Steam Input on the PC can read and remap them.
+Turn any Steam Deck into a wired game controller for a PC. While the app is
+running the Deck's controls are forwarded over its USB-C port to the connected
+computer: as a **native Xbox 360 (XInput) controller** where the host accepts
+it, and — after an automatic per-host probe — as a **standard USB HID
+gamepad** (the universally supported fallback, used on Windows). Everything
+happens in Game Mode: you launch a small "fake game" from your library, it
+opens a window, and the Deck becomes a controller. Closing the "game" returns
+the Deck to normal USB.
 
 Everything happens in Game Mode: you launch a small "fake game" from your
 library, it opens a window, and the Deck becomes a gamepad. Closing the "game"
@@ -18,9 +23,22 @@ Game Mode processes cannot run as root, so the app is split in two:
    keeps Steam Input's virtual gamepad alive, shows a small X11 window, and
    keeps a marker file (`/home/deck/usb-gamepad-active`) fresh.
 2. **A root daemon** (`usb-gamepad.service`) starts at boot. It watches the
-   marker. When the game is running it sets up the USB HID gadget, reads the
-   virtual gamepad and forwards reports to `/dev/hidg0`. When the game closes
-   it tears the gadget down.
+   marker. When the game is running it brings up the controller gadget
+   (Xbox 360 pad over FunctionFS, switching automatically to a standard HID
+   gamepad when the host ignores XInput), reads the virtual gamepad and
+   forwards reports to the PC. When the game closes it tears the gadget down.
+
+### Which protocol will my PC get?
+
+| Host | Result | Timeline after launching the game |
+|------|--------|-----------------------------------|
+| Linux PCs | Native **Xbox 360 (XInput)** controller via the kernel `xpad` driver | Immediate |
+| Windows PCs | Standard **USB HID gamepad** (Steam Input maps it for games) | One probe cycle (~15 s), then a device re-enumeration |
+
+The automatic switch happens because Windows' XInput driver requires
+hardware-authentic descriptors that cannot be reproduced through the kernel's
+FunctionFS gadget; a plain HID gamepad needs none of that and every modern
+game accepts it through Steam Input / native HID APIs.
 
 ---
 
@@ -172,12 +190,15 @@ cat /home/deck/usb-gamepad.log
 
 1. Connect the Deck to the PC with a data-capable USB-C cable.
 2. In Game Mode, launch the "USB Gamepad" game.
-3. A small window titled **USB Gamepad** shows "USB Gamepad Active". The PC
-   should now see a device named **Steam Deck Gamepad**.
-4. Play! The Deck's sticks, triggers, buttons, D-pad and trackpads (if mapped)
-   are forwarded to the PC as a gamepad.
-5. To stop: close the "game" (Steam button -> the game's X, or the gamepad
-   shortcut). The gadget is torn down and the Deck returns to normal USB.
+3. A small window titled **USB Gamepad** shows "USB Gamepad Active".
+   - On a Linux PC: the device appears as a wired Xbox 360 controller.
+   - On Windows: the controller first appears as an Xbox 360 pad, then after
+     ~15 s the log line `Switching to HID compatibility mode` is followed by
+     `HID gamepad ready (/dev/hidg0)` and the PC re-enumerates it as a
+     standard USB gamepad. This is expected.
+4. Play! Sticks, triggers, buttons, D-pad are forwarded to the PC.
+5. To stop: close the "game" (Steam button -> the game's X). The gadget is
+   torn down and the Deck returns to normal USB.
 
 ---
 
@@ -197,12 +218,11 @@ journalctl -u usb-gamepad -f
 
 | Symptom | Fix |
 | --- | --- |
-| Steam loading screen stays forever | `libx11` was not installed before running the installer, so a headless launcher was built. Install `libx11` (Step 1) and re-run the installer (Step 3). |
+| **Windows**: controller switches from "Xbox 360" to a generic gamepad after ~15 s | Working as designed. Windows cannot drive emulated Xbox 360 pads through FunctionFS; the app switches to standard HID automatically. Verify with `HID gamepad ready` in the log and a responsive pad in `joy.cpl`. |
+| Controller listed but no input anywhere | Check `Status: input_events=` climbs in the log while you press buttons. If it stays 0, Steam Input is not feeding its virtual pad — keep the "USB Gamepad" game focused in Game Mode. |
+| `No gamepad found` / device refresh spam | Reboot the Deck; on logins where Steam is slow to expose its virtual pad, waiting 30 s in-game resolves it. |
 | Log shows `No UDC present` / `No UDC became available` | The Deck's USB-C port is not in device (DRD) mode. Reboot into BIOS (**Volume Up + Power**), go to Advanced -> USB Configuration, set **USB Dual Role Device** to **DRD**, save and reboot. |
-| Log shows `ERROR: USB HID gadget setup failed: Permission denied ...` | The daemon is not running as root. Check `systemctl status usb-gamepad`. |
-| PC sees the gamepad but no input arrives | The log must show `Reading Microsoft X-Box 360 pad 0 (...)`. If it shows `Reading Sony ...` or a built-in pad, Steam Input is not active — make sure the game launched from Game Mode is in focus, and that the Deck's controller layout is set to "Gamepad". |
-| Nothing happens / no `Reading ...` line | Check the log for the latest `No gamepad found`/`Refresh` lines. Sometimes Steam takes a few seconds to expose its virtual pad. |
-| Both the Decky plugin and this app run | Disable the `deck-usb-xinput-controller` Decky plugin (and its autostart) — both drive the same gadget and will fight. |
+| `ERROR: USB gadget setup failed: ...` | Read the full error in `journalctl -u usb-gamepad -n 50 --no-pager`; stale configfs state self-heals on retry, persistent errors usually mean DRD mode is off (see above). |
 | Daemon died | `sudo systemctl restart usb-gamepad`. The service has `Restart=on-failure`. |
 
 ---

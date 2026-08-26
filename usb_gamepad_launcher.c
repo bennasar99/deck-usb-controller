@@ -84,12 +84,21 @@ extern int XPending(Display *);
 extern int XNextEvent(Display *, XEvent *);
 
 enum { X_Expose = 12, X_ConfigureNotify = 22,
-       X_ExposureMask = (1L << 15), X_StructureNotifyMask = (1L << 17) };
+       X_MotionNotify = 6, X_ButtonPress = 4, X_ButtonRelease = 5,
+       X_KeyPress = 2,
+       X_ExposureMask = (1L << 15), X_StructureNotifyMask = (1L << 17),
+       X_PointerMotionMask = (1L << 6), X_ButtonPressMask = (1L << 2),
+       X_ButtonReleaseMask = (1L << 3), X_KeyPressMask = (1L << 0) };
 
 static Display *dpy = NULL;
 static Window win;
 static GC gc;
 static Font g_font = 0;
+
+/* OLED burn-in protection state: after IDLE_SECS without pointer/button
+ * activity the window goes full black; any input restores it. */
+static int g_dimmed = 0;
+static struct timeval g_last_input = {0, 0};
 
 static int ignore_xerror(Display *d, void *e) {
     (void)d;
@@ -100,6 +109,14 @@ static int ignore_xerror(Display *d, void *e) {
 static void draw(void) {
     if (!dpy)
         return;
+    /* OLED burn-in protection: full black after 10 s without touch/mouse
+     * input; any pointer activity returns to normal immediately. */
+    if (g_dimmed) {
+        XSetForeground(dpy, gc, 0x000000);
+        XFillRectangle(dpy, win, gc, 0, 0, WIN_W, WIN_H);
+        XFlush(dpy);
+        return;
+    }
     XSetForeground(dpy, gc, 0x181825); /* dark background */
     XFillRectangle(dpy, win, gc, 0, 0, WIN_W, WIN_H);
     if (g_font) {
@@ -107,11 +124,28 @@ static void draw(void) {
         XSetForeground(dpy, gc, 0x89B4FA);
         XDrawString(dpy, win, gc, 20, 60, "USB Gamepad Active", 18);
         XSetForeground(dpy, gc, 0xA6ADB0);
-        XDrawString(dpy, win, gc, 20, 95, "Steam Deck -> PC (HID)", 22);
+        XDrawString(dpy, win, gc, 20, 95, "Steam Deck -> PC", 16);
         XSetForeground(dpy, gc, 0xA6E3A1);
         XDrawString(dpy, win, gc, 20, 140, "Close this game to stop", 23);
+        XSetForeground(dpy, gc, 0x6C7086);
+        XDrawString(dpy, win, gc, 20, 175,
+                    "Screen blanks after 10 s (touch to wake)", 40);
     }
     XFlush(dpy);
+}
+
+/* True once no pointer/button activity has been seen for IDLE_SECS. */
+#define IDLE_SECS 10
+
+static int screen_should_dim(void) {
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    return (now.tv_sec - g_last_input.tv_sec) >= IDLE_SECS;
+}
+
+static void note_input_activity(void) {
+    gettimeofday(&g_last_input, NULL);
+    g_dimmed = 0;
 }
 
 static void setup_window(void) {
@@ -123,9 +157,13 @@ static void setup_window(void) {
     win = XCreateSimpleWindow(dpy, XRootWindow(dpy, screen), 0, 0, WIN_W, WIN_H,
                               0, XBlackPixel(dpy, screen), XBlackPixel(dpy, screen));
     XStoreName(dpy, win, "USB Gamepad");
-    XSelectInput(dpy, win, X_ExposureMask | X_StructureNotifyMask);
+    XSelectInput(dpy, win,
+                 X_ExposureMask | X_StructureNotifyMask |
+                 X_PointerMotionMask | X_ButtonPressMask |
+                 X_ButtonReleaseMask | X_KeyPressMask);
     gc = XCreateGC(dpy, win, 0, NULL);
     g_font = XLoadFont(dpy, "fixed");
+    gettimeofday(&g_last_input, NULL);   /* blank timer starts at launch */
     XMapWindow(dpy, win);
     draw();
 }
@@ -136,19 +174,45 @@ static void pump_window(void) {
     if (XPending(dpy)) {
         XEvent ev;
         XNextEvent(dpy, &ev);
-        if (ev.type == X_Expose || ev.type == X_ConfigureNotify)
+        switch (ev.type) {
+        case X_Expose:
+        case X_ConfigureNotify:
             draw();
-    } else {
-        int xfd = XConnectionNumber(dpy);
-        fd_set rfds;
-        struct timeval tv = {0, 100000};
-        FD_ZERO(&rfds);
-        FD_SET(xfd, &rfds);
-        select(xfd + 1, &rfds, NULL, NULL, &tv);
-        if (FD_ISSET(xfd, &rfds))
-            return; /* events queued; they will be drained next iteration */
-        draw();     /* keep frames flowing so gamescope keeps showing us */
+            break;
+        case X_MotionNotify:
+        case X_ButtonPress:
+        case X_ButtonRelease:
+        case X_KeyPress:
+            if (g_dimmed) {
+                note_input_activity();
+                draw();          /* wake instantly */
+            } else {
+                note_input_activity();
+            }
+            break;
+        default:
+            break;
+        }
+        return;
     }
+    /* Idle check: flip to black when the timer expires, flip back the moment
+     * any event arrives above. Frames keep flowing either way so gamescope
+     * keeps presenting our window. */
+    int want_dim = screen_should_dim();
+    if (want_dim != g_dimmed) {
+        g_dimmed = want_dim;
+        draw();
+        return;
+    }
+    int xfd = XConnectionNumber(dpy);
+    fd_set rfds;
+    struct timeval tv = {0, 100000};
+    FD_ZERO(&rfds);
+    FD_SET(xfd, &rfds);
+    select(xfd + 1, &rfds, NULL, NULL, &tv);
+    if (FD_ISSET(xfd, &rfds))
+        return; /* events queued; they will be drained next iteration */
+    draw();     /* keep frames flowing so gamescope keeps showing us */
 }
 #endif /* HAVE_X11 */
 
