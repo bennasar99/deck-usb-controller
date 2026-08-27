@@ -1,12 +1,13 @@
-# Installing "Steam Deck -> USB Gamepad" on a Steam Deck
+# Installing "Steam Deck → USB Controller" on a Steam Deck
 
-Turn any Steam Deck into a USB gamepad for a PC. While the app is running the
-Deck's controls are forwarded over its USB-C port to the connected computer as
-a generic HID gamepad, and Steam Input on the PC can read and remap them.
-
-Everything happens in Game Mode: you launch a small "fake game" from your
-library, it opens a window, and the Deck becomes a gamepad. Closing the "game"
-returns the Deck to normal USB.
+Turn any Steam Deck into a wired game controller for a PC. While the app is
+running the Deck's controls are forwarded over its USB-C port to the connected
+computer — as a **native Xbox 360 (XInput) controller** where the host accepts
+it, and (after an automatic per-host probe) as a **standard USB HID gamepad**
+elsewhere (the universally supported path, used on Windows). You can also pin
+the protocol manually in the app window. Everything happens in Game Mode: you
+launch a small "fake game" from your library, it opens a window, and the Deck
+becomes a controller. Closing the "game" returns the Deck to normal USB.
 
 ---
 
@@ -15,12 +16,21 @@ returns the Deck to normal USB.
 Game Mode processes cannot run as root, so the app is split in two:
 
 1. **The "game"** (`/opt/usb-gamepad/usb_gamepad`) runs as the `deck` user. It
-   keeps Steam Input's virtual gamepad alive, shows a small X11 window, and
-   keeps a marker file (`/home/deck/usb-gamepad-active`) fresh.
+   shows the app window (mode buttons + status), keeps Steam Input's virtual
+   gamepad alive, and keeps a marker file (`/home/deck/usb-gamepad-active`)
+   fresh.
 2. **A root daemon** (`usb-gamepad.service`) starts at boot. It watches the
-   marker. When the game is running it sets up the USB HID gadget, reads the
-   virtual gamepad and forwards reports to `/dev/hidg0`. When the game closes
-   it tears the gadget down.
+   marker. When the game is running it brings up the selected gadget, reads
+   the virtual gamepad and forwards reports to the PC. When the game closes it
+   tears the gadget down.
+
+### Modes (selected by clicking in the app window; remembered in `~/usb-gamepad-mode`)
+
+| Mode | Behavior |
+|------|----------|
+| **Auto** (default) | Xbox 360 XInput pad first; if the host never consumes reports, one automatic re-enumeration, then a switch to a standard HID gamepad. |
+| **XInput** | Forces the Xbox 360 pad. Native XInput on Linux hosts. |
+| **HID** | Forces a standard USB HID gamepad — the reliable path on Windows; pair with the Windows bridge (see below) for native XInput. |
 
 ---
 
@@ -30,38 +40,19 @@ Game Mode processes cannot run as root, so the app is split in two:
 - A USB-C cable that supports data (a plain charging cable is not enough).
 - The `deck` user's password (default: `deck`).
 - Internet access on the Deck (to install two packages).
+- BIOS: **USB Dual Role Device = DRD** (Setup Utility → Advanced → USB
+  Configuration; enter with Volume Up + Power).
 
 ---
 
 ## Step 0 — Get a terminal
 
-Either work directly on the Deck, or from a computer over SSH.
-
-### On the Deck (Desktop Mode)
-
-1. Turn the Deck on and switch to **Desktop Mode** (Power -> Switch to Desktop).
-2. Open **Konsole** (KDE terminal).
-
-### From another computer (SSH)
-
-1. On the Deck: Settings -> System -> **Enable Developer Mode** -> Advanced ->
-   **Enable SSH**. Note the Deck's IP address.
-2. From your computer:
-
-   ```bash
-   ssh deck@<deck-ip>
-   ```
-
-   Password is the `deck` user's password (default `deck`).
+Either work directly on the Deck (Desktop Mode → Konsole) or over SSH
+(Settings → System → Developer Mode → Enable SSH, then `ssh deck@<deck-ip>`).
 
 ---
 
 ## Step 1 — Prepare the Deck (read-only filesystem + packages)
-
-SteamOS protects its filesystem. Writing to it and installing packages requires
-temporarily disabling read-only mode.
-
-Run (enter the `deck` password when `sudo` asks):
 
 ```bash
 sudo steamos-readonly disable
@@ -70,34 +61,21 @@ sudo pacman -Sy --noconfirm libx11 base-devel
 
 - `base-devel` provides `gcc`, which compiles the native launcher.
 - `libx11` provides the X11 window support so Game Mode shows the app window
-  instead of the Steam loading screen.
+  (with the mode buttons) instead of a headless build.
 
-You can re-enable read-only mode afterwards (see Step 3).
-
-> **Note:** `sudo` will normally ask for a password — this is expected. The
-> installer needs root to write to `/opt` and `/etc`.
+You can re-enable read-only mode afterwards (Step 3).
 
 ---
 
 ## Step 2 — Copy the app files onto the Deck
 
-The app lives in this folder. Put the whole project on the Deck, e.g.:
-
-### Option A — from a computer
+From a computer:
 
 ```bash
 scp -r deck-usb-xinput-controller deck@<deck-ip>:~/
 ```
 
-### Option B — on the Deck itself
-
-Download the project archive in a browser (Desktop Mode) and extract it into
-`~/deck-usb-xinput-controller`, or:
-
-```bash
-cd ~
-git clone https://github.com/<your-repo>/deck-usb-xinput-controller
-```
+or `git clone` it on the Deck into `~/deck-usb-xinput-controller`.
 
 ---
 
@@ -111,21 +89,22 @@ chmod +x install-usb-gamepad.sh
 
 The installer:
 
-1. Copies the app to `/opt/usb-gamepad`.
+1. Copies the app to `/opt/usb-gamepad` (wiping the previous backend first).
 2. Compiles the native launcher (`gcc -O2 -DHAVE_X11 ... -l:libX11.so.6`).
-3. Installs and starts the root daemon as a systemd service
+3. Installs and **restarts** the root daemon as a systemd service
    (`usb-gamepad.service`, enabled at boot).
 
 You should see:
 
 ```
 Launcher built with an X11 window (Game Mode will show it).
-...
 Daemon enabled and running. It stays idle until the game is launched.
 ```
 
-If you re-enable read-only mode, do it now (the daemon only reads from
-`/opt` and writes to `/sys`, which is always writable):
+If you instead see `WARNING: X11 runtime library not found; building a
+headless launcher`, `libx11` was missing — install it (Step 1) and re-run.
+
+You can re-enable read-only mode now:
 
 ```bash
 sudo steamos-readonly enable
@@ -137,73 +116,86 @@ sudo steamos-readonly enable
 
 ```bash
 systemctl status usb-gamepad
+tail ~/usb-gamepad.log
 ```
 
-Should show `active (running)`. Its startup message lands in
-`/home/deck/usb-gamepad.log`:
-
-```bash
-cat /home/deck/usb-gamepad.log
-```
-
-```
-[hh:mm:ss] USB gamepad daemon started; waiting for the 'USB Gamepad' game.
-```
+Should show `active (running)` and
+`USB XInput controller daemon started ... (mode=auto)`.
 
 ---
 
 ## Step 5 — Add it to Steam
 
 1. Put the Deck back into **Game Mode**.
-2. Open Steam -> **Library**.
-3. **Add a Game** (top-left) -> **Add a Non-Steam Game**.
-4. **Browse...** and select:
-
-   ```
-   /opt/usb-gamepad/usb_gamepad
-   ```
-
-5. Add it. It appears in your library as "usb_gamepad". Rename it to
-   "USB Gamepad" if you like (right-click -> Properties).
+2. Steam → Library → **Add a Game** → **Add a Non-Steam Game** → Browse →
+   `/opt/usb-gamepad/usb_gamepad`. Add it (rename to "USB Gamepad" if you
+   like).
 
 ---
 
 ## Step 6 — Use it
 
 1. Connect the Deck to the PC with a data-capable USB-C cable.
-2. In Game Mode, launch the "USB Gamepad" game.
-3. A small window titled **USB Gamepad** shows "USB Gamepad Active". The PC
-   should now see a device named **Steam Deck Gamepad**.
-4. Play! The Deck's sticks, triggers, buttons, D-pad and trackpads (if mapped)
-   are forwarded to the PC as a gamepad.
-5. To stop: close the "game" (Steam button -> the game's X, or the gamepad
-   shortcut). The gadget is torn down and the Deck returns to normal USB.
+2. Launch the "USB Gamepad" game from your library. The app window shows the
+   status and the three mode buttons (**Auto / XInput / HID**).
+3. Press buttons on the Deck — they should appear on the PC.
+
+What to expect per host:
+
+| Host | Result |
+|------|--------|
+| Linux PC | Native **Xbox 360 (XInput)** controller immediately. |
+| Windows PC | First enumerates as an Xbox 360 pad; after the ~15 s probe the app switches to a standard HID gamepad (`Switching to HID compatibility mode` in the log, then `HID gamepad ready`). |
+| Windows PC + bridge | For native XInput on Windows, run the bridge app below; keep the mode on **HID**. |
+
+---
+
+## Step 7 (optional) — Native XInput on Windows via the bridge
+
+On the Windows PC:
+
+1. Install the **ViGEmBus** driver from <https://vigem.org>.
+2. Build the bridge (once): install Visual Studio 2022/2026 (C++ tools), then
+   in the repo's `windows/` folder:
+   ```bat
+   cmake -S . -B build -G "Visual Studio 18 2026" -A x64
+   cmake --build build --config Release
+   ```
+   (On VS2022 installs use `-G "Visual Studio 17 2022"`.)
+3. Run `build\Release\deck2xinput.exe` while the Deck game is running.
+   - `-d` prints raw reports + decoded values (debugging).
+   - `-i` / `--invert-y` flips stick Y for games that expect the opposite
+     convention; `--no-invert-y` forces the standard one.
+4. The bridge creates a virtual **Xbox 360 controller** and replays the
+   Deck's inputs — games see genuine XInput.
+
+Keep the app mode on **HID** for this; the bridge consumes the HID feed
+directly (the gadget is deliberately invisible to games).
 
 ---
 
 ## Logs & troubleshooting
 
-All messages (launcher + daemon) are appended to:
-
-```
-/home/deck/usb-gamepad.log
-```
-
-The daemon's own output is also in the systemd journal:
+All messages (launcher + daemon) are appended to
+`/home/deck/usb-gamepad.log`; the daemon's output is also in the journal:
 
 ```bash
-journalctl -u usb-gamepad -f
+journalctl -u usb-gamepad -n 50 --no-pager
 ```
+
+The periodic `Status:` line decodes the live state —
+`input_events=N` counts Deck inputs, `polls=M` counts reports consumed by the
+host. Triage:
 
 | Symptom | Fix |
 | --- | --- |
-| Steam loading screen stays forever | `libx11` was not installed before running the installer, so a headless launcher was built. Install `libx11` (Step 1) and re-run the installer (Step 3). |
-| Log shows `No UDC present` / `No UDC became available` | The Deck's USB-C port is not in device (DRD) mode. Reboot into BIOS (**Volume Up + Power**), go to Advanced -> USB Configuration, set **USB Dual Role Device** to **DRD**, save and reboot. |
-| Log shows `ERROR: USB HID gadget setup failed: Permission denied ...` | The daemon is not running as root. Check `systemctl status usb-gamepad`. |
-| PC sees the gamepad but no input arrives | The log must show `Reading Microsoft X-Box 360 pad 0 (...)`. If it shows `Reading Sony ...` or a built-in pad, Steam Input is not active — make sure the game launched from Game Mode is in focus, and that the Deck's controller layout is set to "Gamepad". |
-| Nothing happens / no `Reading ...` line | Check the log for the latest `No gamepad found`/`Refresh` lines. Sometimes Steam takes a few seconds to expose its virtual pad. |
-| Both the Decky plugin and this app run | Disable the `deck-usb-xinput-controller` Decky plugin (and its autostart) — both drive the same gadget and will fight. |
-| Daemon died | `sudo systemctl restart usb-gamepad`. The service has `Restart=on-failure`. |
+| `input_events=0` while pressing buttons | Steam Input only feeds its virtual pad while the "USB Gamepad" game has Game Mode focus. Stay focused on the game while testing. |
+| `input_events` climbs, `polls=0` (Windows) | Host isn't consuming XInput — expected on Windows; wait for the automatic switch to HID, or select **HID** mode manually. |
+| `No UDC` / `state=not attached` errors | USB-C port not in DRD mode — fix in BIOS (see Requirements). |
+| Steam loading screen stays forever | `libx11` was missing during install (headless launcher). Install it and re-run the installer. |
+| Mode buttons don't respond | Headless launcher (see above), or taps not reaching the window — re-run the installer with `libx11` installed. |
+| Daemon died / weird double starts | `sudo systemctl restart usb-gamepad`; a singleton lock prevents two instances. |
+| Sticks/D-pad inverted in-game only on Windows | Ensure `deck2xinput.exe` runs (mode **HID**); try `-i` / `--invert-y` if the game expects the opposite Y convention. |
 
 ---
 
@@ -216,7 +208,8 @@ cd ~/deck-usb-xinput-controller
 ./install-usb-gamepad.sh
 ```
 
-The installer overwrites `/opt/usb-gamepad` and reinstalls the service.
+The installer wipes `/opt/usb-gamepad/backend` (so stale modules can never
+persist), recompiles the launcher, and explicitly restarts the service.
 
 ---
 
@@ -229,21 +222,16 @@ sudo systemctl daemon-reload
 sudo rm -rf /opt/usb-gamepad
 ```
 
-Then remove the "USB Gamepad" entry from Steam, and delete the
-`~/deck-usb-xinput-controller` folder on the Deck.
-
-Optionally remove leftover rules from earlier versions (no longer used):
-
-```bash
-sudo rm -f /etc/sudoers.d/usb-gamepad
-```
+Then remove the "USB Gamepad" entry from Steam and delete
+`~/deck-usb-xinput-controller` on the Deck. If the Windows bridge was
+installed as a scheduled task: `schtasks /delete /tn "Deck2XInput" /f`.
 
 ---
 
 ## Safety notes
 
-- While the "game" is running, the Deck's USB-C port acts as a USB *device*.
-  Docking/charging a connected hub behaves differently during that time.
-- The Deck stays in gadget mode until you close the game (and briefly after,
-  while the daemon tears the gadget down).
+- While the "game" is running, the Deck's USB-C port acts as a USB *device*;
+  docks/hubs behave differently during that time.
+- The app window blanks (OLED protection) after 10 s without input; forwarding
+  continues regardless.
 - The app writes reports only while the game window is open and focused.

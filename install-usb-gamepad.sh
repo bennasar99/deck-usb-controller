@@ -14,10 +14,16 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 
 echo "Installing USB gamepad app to $APP ..."
 sudo mkdir -p "$APP"
+# Remove any previous payload first: an old backend must never be merged into
+# (or shadowed next to) the current one -- stale modules are how a device can
+# keep enumerating as plain HID instead of XInput after an upgrade.
+sudo rm -rf "$APP/backend"
 sudo cp -r "$SRC/backend" "$APP/backend"
 sudo cp "$SRC/usb_gamepad.py" "$APP/usb_gamepad.py"
 sudo cp "$SRC/usb_gamepad_launcher.c" "$APP/usb_gamepad_launcher.c"
 sudo chmod +x "$APP/usb_gamepad.py"
+echo "Installed backend modules:"
+(sudo ls "$APP/backend") | sed 's/^/    /'
 
 # Compile a native ELF launcher. Steam in Game Mode does not reliably run a
 # bare shell script as a non-Steam game, but a real binary always works.
@@ -58,7 +64,10 @@ printf '%s\n' \
     'WantedBy=multi-user.target' \
     | sudo tee /etc/systemd/system/usb-gamepad.service > /dev/null
 sudo systemctl daemon-reload
-sudo systemctl enable --now usb-gamepad
+sudo systemctl enable usb-gamepad
+# enable --now is a no-op when the service already runs, so explicitly restart
+# to make sure the fresh code (not the previously loaded modules) is live.
+sudo systemctl restart usb-gamepad
 echo "Daemon enabled and running. It stays idle until the game is launched."
 
 echo
