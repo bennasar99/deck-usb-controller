@@ -44,6 +44,7 @@ MARKER_STALE_SECS = 5.0
 # ("auto" | "xinput" | "hid"). "auto" = XInput first, automatic HID
 # fallback when the host ignores it.
 MODE_FILE = os.path.join(DECK_HOME, "usb-gamepad-mode")
+BT_FLAG = os.path.join(DECK_HOME, "usb-gamepad-bt")
 
 
 def read_mode():
@@ -56,6 +57,14 @@ def read_mode():
     except OSError:
         pass
     return "auto"
+
+
+def read_bt_enabled():
+    try:
+        with open(BT_FLAG, "r") as handle:
+            return handle.read(8).strip() == "1"
+    except OSError:
+        return False
 
 
 def log(msg):
@@ -147,11 +156,48 @@ def main():
     hid_recoveries = 0
     applied_wanted = read_mode()      # mode selection applied to the gadget
     switched_to_hid = False           # auto-mode XInput->HID switch happened
+    bt_service = None
+    bt_pending = b""
+    bt_last = b""
 
     log("USB XInput controller daemon started (build 2026-08-xinput-ffs, "
         "mode=%s); waiting for the 'USB Gamepad' game." % applied_wanted)
     try:
+        bt_retry_after = 0.0   # backoff when the BT stack is unavailable
         while not _stop:
+            # Independent Bluetooth HID toggle: runs alongside any USB mode
+            # (BT stays live even when the game is closed).
+            want_bt = read_bt_enabled()
+            if want_bt and bt_service is None and time.time() >= bt_retry_after:
+                try:
+                    from backend.bt_hogp import BtHogpService
+                    bt_service = BtHogpService(logger=log)
+                    bt_service.start()
+                    bt_last = b""
+                    log("Bluetooth enabled; BT HID service started.")
+                except Exception as exc:
+                    bt_retry_after = time.time() + 30.0
+                    log("Bluetooth service unavailable (retry in 30 s): %s"
+                        % exc)
+                    want_bt = False
+            elif not want_bt and bt_service is not None:
+                try:
+                    from backend.bt_hogp import BtHogpService
+                    bt_service = BtHogpService(logger=log)
+                    bt_service.start()
+                    bt_last = b""
+                    log("Bluetooth enabled; BT HID service started.")
+                except Exception as exc:
+                    log("Bluetooth service unavailable: %s" % exc)
+                    want_bt = False
+            elif not want_bt and bt_service is not None:
+                log("Bluetooth disabled; stopping BT service.")
+                try:
+                    bt_service.stop()
+                except Exception as exc:
+                    log("BT stop failed: %s" % exc)
+                bt_service = None
+
             if not marker_fresh():
                 if gadget_up:
                     log("Game session ended; returning the Deck to normal USB.")
@@ -287,6 +333,9 @@ def main():
                     pending = (build_hid_frame(reader, state)
                                if manager.mode == "hid"
                                else build_xinput_frame(reader, state))
+                    # The Bluetooth feed always carries the HID frame,
+                    # independent of the USB protocol.
+                    bt_pending = build_hid_frame(reader, state)
 
             # Delivery is decoupled from event building: ep1 writes block
             # until the host consumes them, so they run on the writer thread
@@ -295,6 +344,11 @@ def main():
             if pending and pending != last_frame and manager.enabled:
                 if manager.send_report(pending) == 0:
                     last_frame = pending
+
+            # Bluetooth forwarding (independent of the USB gadget state).
+            if bt_service is not None and bt_pending and bt_pending != bt_last:
+                if bt_service.send_report(bt_pending) == 0:
+                    bt_last = bt_pending
 
             # Watchdog. NOTE: an idle pad freezes polls by design (frames are
             # only written on state change), so "host not consuming" may only
@@ -345,7 +399,7 @@ def main():
                         manager = GadgetManager(logger=log, sudo=False)
                         time.sleep(1.0)
                 elif manager.mode == "xinput":
-                    # User forced XInput: recover once, then stay put —
+                    # User forced XInput: recover once, then stay put â€”
                     # switching protocols was explicitly disabled.
                     if resets_done == 0:
                         resets_done = 1
@@ -385,6 +439,11 @@ def main():
                 manager.stop()
             except Exception as exc:
                 log("teardown failed: %s" % exc)
+        if bt_service is not None:
+            try:
+                bt_service.stop()
+            except Exception as exc:
+                log("BT teardown failed: %s" % exc)
     return 0
 
 

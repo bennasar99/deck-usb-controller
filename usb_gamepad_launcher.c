@@ -75,6 +75,28 @@ static void write_mode(int mode) {
     fclose(f);
 }
 
+#define BT_FLAG_PATH "/home/deck/usb-gamepad-bt"
+
+static int read_bt_enabled(void) {
+    FILE *f = fopen(BT_FLAG_PATH, "r");
+    char buf[8] = {0};
+    int on = 0;
+    if (f) {
+        if (fgets(buf, sizeof buf, f))
+            on = (buf[0] == '1');
+        fclose(f);
+    }
+    return on;
+}
+
+static void write_bt_enabled(int on) {
+    FILE *f = fopen(BT_FLAG_PATH, "w");
+    if (!f)
+        return;
+    fputs(on ? "1" : "0", f);
+    fclose(f);
+}
+
 static int slen(const char *s) {
     int n = 0;
     while (s[n])
@@ -206,10 +228,23 @@ static void draw(void) {
         XSetForeground(dpy, gc, 0xA6ADB0);
         XDrawString(dpy, win, gc, 20, 205, descs[mode], slen(descs[mode]));
 
+        /* Bluetooth toggle (independent of the USB protocol modes). */
+        {
+            const int bt_on = read_bt_enabled();
+            const char *bt_label = bt_on ? "Bluetooth: ON" : "Bluetooth: OFF";
+            const int label_w = slen(bt_label) * 9;
+            XSetForeground(dpy, gc, bt_on ? 0x89B4FA : 0x313244);
+            XFillRectangle(dpy, win, gc, 30, 225, 580, 44);
+            XSetForeground(dpy, gc, bt_on ? 0x000000 : 0x89B4FA);
+            XDrawRectangle(dpy, win, gc, 30, 225, 580, 44);
+            XDrawString(dpy, win, gc, 30 + (580 - label_w) / 2, 253,
+                        bt_label, slen(bt_label));
+        }
+
         XSetForeground(dpy, gc, 0x6C7086);
-        XDrawString(dpy, win, gc, 20, 250,
+        XDrawString(dpy, win, gc, 20, 320,
                     "Screen blanks after 10 s (touch to wake)", 40);
-        XDrawString(dpy, win, gc, 20, 280,
+        XDrawString(dpy, win, gc, 20, 350,
                     "Close this game to stop", 23);
     }
     XFlush(dpy);
@@ -282,8 +317,8 @@ static void pump_window(void) {
                  * (relative to our struct: +56 / +60 past `type`). */
                 const int cx = ev_x(&ev);
                 const int cy = ev_y(&ev);
-                int i;
-                for (i = 0; i < 3; ++i) {
+                int handled = 0;
+                for (int i = 0; i < 3; ++i) {
                     if (cx >= g_buttons[i].x &&
                         cx < g_buttons[i].x + g_buttons[i].w &&
                         cy >= g_buttons[i].y &&
@@ -291,13 +326,23 @@ static void pump_window(void) {
                         read_mode() != i) {
                         write_mode(i);
                         log_msg(i == MODE_XINPUT ? "usb_gamepad: mode set "
-                                  "to XInput (raw_gadget+FFS)."
+                                  "to XInput (FunctionFS)."
                                 : i == MODE_HID ? "usb_gamepad: mode set "
                                   "to HID (pair with the Windows bridge)."
                                 : "usb_gamepad: mode set to Auto.");
+                        handled = 1;
                         break;
                     }
                 }
+                if (!handled && cx >= 30 && cx < 610 &&
+                    cy >= 225 && cy < 269) {
+                    write_bt_enabled(!read_bt_enabled());
+                    log_msg(read_bt_enabled()
+                            ? "usb_gamepad: Bluetooth enabled."
+                            : "usb_gamepad: Bluetooth disabled.");
+                    handled = 1;
+                }
+                (void)handled;
             }
             note_input_activity();
             draw();          /* wake instantly + refresh selection */

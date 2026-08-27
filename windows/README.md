@@ -1,11 +1,18 @@
 # deck2xinput — Steam Deck HID → XInput (ViGEmBus)
 
-Windows companion app for **deck-usb-xinput-controller**. When the Deck app is
-in **HID compatibility mode** (its automatic mode on Windows hosts), this tool
-reads the Deck's 13-byte HID gamepad reports (`0079:0006` "Steam Deck Gamepad")
-and replays them into a **virtual Xbox 360 controller** through the
-[ViGEmBus](https://vigem.org) driver — so Windows games see genuine XInput
-without per-game wrappers (x360ce-style, but as one system-wide app).
+Windows companion app for **deck-usb-xinput-controller**. It reads the Deck's
+12-byte gamepad HID reports and replays them into a **virtual Xbox 360
+controller** through the [ViGEmBus](https://vigem.org) driver — so Windows
+games see genuine XInput without per-game wrappers.
+
+It automatically consumes the Deck's feed from **either transport**:
+
+- **Wired (USB-C)**: the gadget `0079:0006` "Steam Deck Gamepad" (HID mode;
+  vendor-defined usage, invisible to games).
+- **Wireless (Bluetooth)**: the BLE HID device **"SteamDeckPad"** (paired
+  from the PC's Bluetooth settings; same 0079:0006 PnP identity).
+
+Both can be attached at once — the most recent report wins.
 
 ## Prerequisites
 
@@ -89,9 +96,9 @@ the game — this app feeds 1:1 raw values.
 
 - **"ViGEmBus connect failed"** — the ViGEmBus driver is not installed (or is
   the pre-1.16 legacy build). Install/upgrade from vigem.org and reboot once.
-- **Stuck on "Waiting for the Deck gamepad"** — the Deck app hasn't switched
-  to HID mode yet. Check `~/usb-gamepad.log` on the Deck for
-  `HID gamepad ready (/dev/hidg0)`; also verify the gadget identity under
-  Device Manager is `0079:0006` "Steam Deck Gamepad".
+- **Stuck on "Waiting for the Deck gamepad"** — the Deck app must be in HID
+  mode (or Bluetooth toggled ON and paired). Check `~/usb-gamepad.log` on the
+  Deck for `HID gamepad ready (/dev/hidg0)`; verify the device under Device
+  Manager identifies as `0079:0006` or "SteamDeckPad".
 - **Inputs land in joy.cpl but not the virtual pad** — another feeder (e.g.
   a leftover x360ce instance) may hold the device; close it.

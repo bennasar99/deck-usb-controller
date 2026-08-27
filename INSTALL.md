@@ -31,6 +31,7 @@ Game Mode processes cannot run as root, so the app is split in two:
 | **Auto** (default) | Xbox 360 XInput pad first; if the host never consumes reports, one automatic re-enumeration, then a switch to a standard HID gamepad. |
 | **XInput** | Forces the Xbox 360 pad. Native XInput on Linux hosts. |
 | **HID** | Forces a standard USB HID gamepad — the reliable path on Windows; pair with the Windows bridge (see below) for native XInput. |
+| **Bluetooth** (toggle) | Advertises the Deck as a BLE HID gamepad "SteamDeckPad". Pair from the PC's Bluetooth settings; Windows maps it natively (Steam Input refines it). Works alongside any USB mode. |
 
 ---
 
@@ -171,6 +172,14 @@ On the Windows PC:
 
 Keep the app mode on **HID** for this; the bridge consumes the HID feed
 directly (the gadget is deliberately invisible to games).
+
+### Alternative: Bluetooth (no cable, no bridge)
+
+Toggle **Bluetooth: ON** in the app window, then on the PC:
+Settings → Bluetooth → connect to **SteamDeckPad** (confirm the pairing pin
+on both devices). Windows 10+ recognizes it as a BLE HID gamepad natively —
+no ViGEmBus or bridge needed. First-time pairing may require a mapping pass
+in the game's/Steam's controller settings.
 
 ---
 

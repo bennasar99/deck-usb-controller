@@ -11,8 +11,12 @@ triggers, buttons and D-pad are forwarded over the USB link to the host PC.
 | **XInput** | Forces the Xbox 360 gadget (FunctionFS). Native XInput on Linux hosts. |
 | **HID** | Forces the standard HID gamepad — pair it with the Windows bridge app (`windows/deck2xinput.exe`, ViGEmBus) for native XInput on Windows. |
 
-The selection is remembered (written to `~/usb-gamepad-mode`) and applied
-immediately — switching takes ~2 s, no relaunch needed.
+| **HID** | Forces the standard HID gamepad — pair it with the Windows bridge app (`windows/deck2xinput.exe`, ViGEmBus) for native XInput on Windows. |
+| **Bluetooth** (toggle) | Independent of the USB modes: advertises the Deck as a BLE HID gamepad ("SteamDeckPad"). Pair it from the PC's Bluetooth settings — Windows 10+ maps it natively, Steam Input refines it. |
+
+The selection is remembered (written to `~/usb-gamepad-mode` and
+`~/usb-gamepad-bt`) and applied immediately — switching takes ~2 s, no
+relaunch needed. Bluetooth runs alongside any USB mode.
 
 > Requires the Deck's USB-C port to be in **DRD (Dual Role Device)** mode in
 > the BIOS. See [INSTALL.md](./INSTALL.md).
@@ -46,6 +50,11 @@ Game Mode processes cannot run as root, so the app is split in two:
   vendor-defined top-level usage — invisible to games, consumed only by the
   Windows bridge — with the D-pad encoded as button bits to avoid host
   hat-switch heuristics.
+* **Bluetooth**: a BLE HID-over-GATT service (`backend/bt_hogp.py`) presents
+  the Deck as a "SteamDeckPad" gamepad over BlueZ (D-Bus GATT server +
+  LE advertisement, static BLE address for stable identity). Windows 10+
+  pairs with it natively; no bridge or ViGEmBus needed. Requires the
+  `python-gobject` package (installed by the installer).
 
 ## Files
 

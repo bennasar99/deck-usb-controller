@@ -1,5 +1,9 @@
 #!/bin/bash
-# Installs the standalone USB gamepad forwarder so it can be launched from
+# Install
+# sudo steamos-readonly disable
+# sudo pacman -Sy --noconfirm libx11 base-devel python-gobject
+# Bluetooth mode additionally uses python-gobject (PyGObject, for the BlueZ
+# D-Bus HOGP service).s the standalone USB gamepad forwarder so it can be launched from
 # Game Mode as a non-Steam game. Run ONCE on the Deck as the deck user:
 #
 #   chmod +x install-usb-gamepad.sh
@@ -13,6 +17,9 @@ APP=/opt/usb-gamepad
 SRC="$(cd "$(dirname "$0")" && pwd)"
 
 echo "Installing USB gamepad app to $APP ..."
+# python-gobject is needed for the Bluetooth (BLE HID-over-GATT) mode.
+sudo pacman -Sy --noconfirm python-gobject >/dev/null 2>&1 || \
+    echo "WARNING: could not install python-gobject; Bluetooth mode disabled."
 sudo mkdir -p "$APP"
 # Remove any previous payload first: an old backend must never be merged into
 # (or shadowed next to) the current one -- stale modules are how a device can
@@ -41,7 +48,7 @@ if command -v gcc >/dev/null 2>&1; then
 else
     echo "ERROR: gcc not found; a native launcher is required."
     echo "Install it with:"
-    echo "  sudo steamos-readonly disable && sudo pacman -Sy base-devel"
+    echo "  sudo steamos-readonly disable && sudo pacman -Sy base-devel python-gobject"
     exit 1
 fi
 
