@@ -36,6 +36,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/select.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -43,8 +44,45 @@
 
 #define MARKER_PATH "/home/deck/usb-gamepad-active"
 #define LOG_PATH    "/home/deck/usb-gamepad.log"
+#define MODE_PATH   "/home/deck/usb-gamepad-mode"
 #define WIN_W       640
-#define WIN_H       360
+#define WIN_H       420
+
+enum { MODE_AUTO = 0, MODE_XINPUT = 1, MODE_HID = 2 };
+
+static int read_mode(void) {
+    FILE *f = fopen(MODE_PATH, "r");
+    char buf[16] = {0};
+    int mode = MODE_AUTO;
+    if (f) {
+        if (fgets(buf, sizeof buf, f)) {
+            if (strncmp(buf, "xinput", 6) == 0)      mode = MODE_XINPUT;
+            else if (strncmp(buf, "hid", 3) == 0)    mode = MODE_HID;
+            else if (strncmp(buf, "auto", 4) == 0)   mode = MODE_AUTO;
+        }
+        fclose(f);
+    }
+    return mode;
+}
+
+static void write_mode(int mode) {
+    FILE *f = fopen(MODE_PATH, "w");
+    if (!f)
+        return;
+    fputs(mode == MODE_XINPUT ? "xinput"
+          : mode == MODE_HID  ? "hid"
+                              : "auto", f);
+    fclose(f);
+}
+
+static int slen(const char *s) {
+    int n = 0;
+    while (s[n])
+        n++;
+    return n;
+}
+
+static void log_msg(const char *msg);   /* defined below main helpers */
 
 #ifdef HAVE_X11
 /* -- minimal header-free declarations of the Xlib functions we use -- */
@@ -77,6 +115,8 @@ extern int XFillRectangle(Display *, Drawable, GC, int, int,
 extern int XDrawString(Display *, Drawable, GC, int, int, const char *, int);
 extern int XMapWindow(Display *, Window);
 extern int XFlush(Display *);
+extern int XDrawRectangle(Display *, Drawable, GC, int, int,
+                          unsigned int, unsigned int);
 extern XErrorHandler XSetErrorHandler(XErrorHandler);
 extern int XSelectInput(Display *, Window, long);
 extern int XConnectionNumber(Display *);
@@ -100,6 +140,19 @@ static Font g_font = 0;
 static int g_dimmed = 0;
 static struct timeval g_last_input = {0, 0};
 
+/* Protocol mode selector buttons (drawn by draw(), clicked in
+ * pump_window()). The selection is persisted to MODE_PATH for the daemon. */
+typedef struct {
+    int x, y, w, h;
+    const char *label;
+} UiButton;
+
+static UiButton g_buttons[3] = {
+    { 30, 150, 180, 46, "Auto" },
+    { 230, 150, 180, 46, "XInput" },
+    { 430, 150, 180, 46, "HID" },
+};
+
 static int ignore_xerror(Display *d, void *e) {
     (void)d;
     (void)e;
@@ -120,16 +173,44 @@ static void draw(void) {
     XSetForeground(dpy, gc, 0x181825); /* dark background */
     XFillRectangle(dpy, win, gc, 0, 0, WIN_W, WIN_H);
     if (g_font) {
+        int mode = read_mode();
+        int i;
+        static const char *labels[3] = {"Auto", "XInput", "HID"};
+        static const char *descs[3] = {
+            "Auto: XInput first; falls back to HID when ignored",
+            "XInput: native on Linux hosts (Windows needs the bridge)",
+            "HID: standard gamepad; pair with the Windows bridge app",
+        };
         XSetFont(dpy, gc, g_font);
+
         XSetForeground(dpy, gc, 0x89B4FA);
-        XDrawString(dpy, win, gc, 20, 60, "USB Gamepad Active", 18);
-        XSetForeground(dpy, gc, 0xA6ADB0);
-        XDrawString(dpy, win, gc, 20, 95, "Steam Deck -> PC", 16);
+        XDrawString(dpy, win, gc, 20, 40, "USB Gamepad", 11);
         XSetForeground(dpy, gc, 0xA6E3A1);
-        XDrawString(dpy, win, gc, 20, 140, "Close this game to stop", 23);
+        XDrawString(dpy, win, gc, 20, 80, "USB Gamepad Active", 18);
+
+        XSetForeground(dpy, gc, 0xCDD6F4);
+        XDrawString(dpy, win, gc, 20, 125, "Controller mode (click):", 23);
+        for (i = 0; i < 3; ++i) {
+            const int selected = (mode == i);
+            const int label_w = slen(labels[i]) * 9;
+            XSetForeground(dpy, gc, selected ? 0xA6E3A1 : 0x313244);
+            XFillRectangle(dpy, win, gc, g_buttons[i].x, g_buttons[i].y,
+                           g_buttons[i].w, g_buttons[i].h);
+            XSetForeground(dpy, gc, selected ? 0x000000 : 0xCDD6F4);
+            XDrawRectangle(dpy, win, gc, g_buttons[i].x, g_buttons[i].y,
+                           g_buttons[i].w, g_buttons[i].h);
+            XDrawString(dpy, win, gc,
+                        g_buttons[i].x + (g_buttons[i].w - label_w) / 2,
+                        g_buttons[i].y + 28, labels[i], slen(labels[i]));
+        }
+        XSetForeground(dpy, gc, 0xA6ADB0);
+        XDrawString(dpy, win, gc, 20, 205, descs[mode], slen(descs[mode]));
+
         XSetForeground(dpy, gc, 0x6C7086);
-        XDrawString(dpy, win, gc, 20, 175,
+        XDrawString(dpy, win, gc, 20, 250,
                     "Screen blanks after 10 s (touch to wake)", 40);
+        XDrawString(dpy, win, gc, 20, 280,
+                    "Close this game to stop", 23);
     }
     XFlush(dpy);
 }
@@ -146,6 +227,19 @@ static int screen_should_dim(void) {
 static void note_input_activity(void) {
     gettimeofday(&g_last_input, NULL);
     g_dimmed = 0;
+}
+
+/* XButtonEvent coordinates on LP64: x at byte 64, y at 68 (56/60 into the
+ * struct after `type`). Gamescope touch maps to button/motion events. */
+static int ev_x(const XEvent *ev) {
+    int v = 0;
+    memcpy(&v, ev->_pad + 60, sizeof v);
+    return v;
+}
+static int ev_y(const XEvent *ev) {
+    int v = 0;
+    memcpy(&v, ev->_pad + 64, sizeof v);
+    return v;
 }
 
 static void setup_window(void) {
@@ -183,12 +277,30 @@ static void pump_window(void) {
         case X_ButtonPress:
         case X_ButtonRelease:
         case X_KeyPress:
-            if (g_dimmed) {
-                note_input_activity();
-                draw();          /* wake instantly */
-            } else {
-                note_input_activity();
+            if (ev.type == X_ButtonPress) {
+                /* XButtonEvent is 64-bit: x at byte offset 64, y at 68
+                 * (relative to our struct: +56 / +60 past `type`). */
+                const int cx = ev_x(&ev);
+                const int cy = ev_y(&ev);
+                int i;
+                for (i = 0; i < 3; ++i) {
+                    if (cx >= g_buttons[i].x &&
+                        cx < g_buttons[i].x + g_buttons[i].w &&
+                        cy >= g_buttons[i].y &&
+                        cy < g_buttons[i].y + g_buttons[i].h &&
+                        read_mode() != i) {
+                        write_mode(i);
+                        log_msg(i == MODE_XINPUT ? "usb_gamepad: mode set "
+                                  "to XInput (raw_gadget+FFS)."
+                                : i == MODE_HID ? "usb_gamepad: mode set "
+                                  "to HID (pair with the Windows bridge)."
+                                : "usb_gamepad: mode set to Auto.");
+                        break;
+                    }
+                }
             }
+            note_input_activity();
+            draw();          /* wake instantly + refresh selection */
             break;
         default:
             break;

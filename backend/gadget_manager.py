@@ -115,12 +115,22 @@ class GadgetManager:
             raise GadgetError(f"Unknown gadget mode: {mode}")
         self.mode = mode
         if mode == "xinput":
-            # Load raw_gadget first: /dev/raw-gadget only exists once the
-            # module is loaded, so the availability check must come second.
-            self._load_module_quiet("raw_gadget")
-            use_raw = (os.path.exists("/dev/raw-gadget")
-                       and not os.path.exists("/opt/usb-gamepad/force-ffs"))
-            if use_raw:
+            # raw_gadget on this neptune kernel is KNOWN BROKEN for the
+            # physical UDC: RUN fails EBUSY (state "not attached"), its
+            # leaked registration even blocks the next configfs bind
+            # (composite EBUSY) until the fd closes. Opt-in for testing via
+            # the marker file; normal boots go straight to FunctionFS.
+            if os.path.exists("/opt/usb-gamepad/try-raw"):
+                # Load libcomposite first: a freshly mounted configfs has no
+                # usb_gadget/ subtree until this module creates it.
+                self._load_module_quiet("libcomposite")
+                self._ensure_configfs_mounted()
+                if not os.path.isdir(
+                        os.path.join(CONFIGFS_PATH, "usb_gadget")):
+                    raise GadgetError(
+                        "configfs has no usb_gadget/ subtree even after "
+                        "loading libcomposite; gadget support missing.")
+                self._cleanup_stale_configfs()
                 try:
                     return self._start_raw()
                 except Exception as exc:
@@ -199,23 +209,46 @@ class GadgetManager:
             raise GadgetError("No UDC available for raw_gadget.")
         # raw_gadget attaches exclusively: any configfs gadget still bound
         # to the UDC makes USB_RAW_IOCTL_RUN fail with EBUSY. Free it first.
+        # IMPORTANT: load libcomposite BEFORE anything else here -- a freshly
+        # mounted configfs has no usb_gadget/ subtree until this module
+        # creates it; cleanup+prime otherwise fail with EPERM on the parent.
+        self._load_module_quiet("libcomposite")
         self._ensure_configfs_mounted()
+        if not os.path.isdir(os.path.join(CONFIGFS_PATH, "usb_gadget")):
+            raise GadgetError(
+                "configfs has no usb_gadget/ subtree even after loading "
+                "libcomposite; gadget support missing from this kernel.")
         self._cleanup_stale_configfs()
         try:
             state = open(f"/sys/class/udc/{udc}/state").read().strip()
         except OSError:
             state = "<unreadable>"
         gadgets = []
+        gadget_listing_error = None
         try:
             gadgets = os.listdir(os.path.join(CONFIGFS_PATH, "usb_gadget"))
-        except OSError:
-            pass
+        except OSError as exc:
+            gadget_listing_error = str(exc)
         self._log(f"raw_gadget: attaching to {udc} "
-                  f"(state={state}, existing gadgets={gadgets or 'none'})")
+                  f"(state={state}, existing gadgets="
+                  f"{gadgets or 'none'})"
+                  + (f" [list failed: {gadget_listing_error}]"
+                     if gadget_listing_error else ""))
         holders = self._raw_gadget_holders()
         if holders:
             self._log(f"raw_gadget: DEVICE ALREADY HELD by {holders} "
                       "(another process must release it or RUN gets EBUSY)")
+        # "Prime" the UDC with a full configfs bind/unbind cycle before the
+        # raw attach. dwc3's peripheral half can sit in a half-started state
+        # (previous killed daemon, lazy teardown) where raw_gadget's driver
+        # registration gets EBUSY even though the UDC reads free; a real
+        # bind -> unbind via the composite driver forces dwc3 through
+        # udc_start/udc_stop and clears that state. Skippable for bisecting.
+        if not os.path.exists("/opt/usb-gamepad/no-raw-prime"):
+            try:
+                self._prime_udc(udc)
+            except Exception as exc:
+                self._log(f"UDC prime cycle failed (non-fatal): {exc}")
         if self.raw is None:
             self.raw = RawGadgetXInput(logger=self._log, udc=udc)
         else:
@@ -231,6 +264,48 @@ class GadgetManager:
             self._log("Host has not configured the controller yet; "
                       "reports will flow as soon as it does.")
         return self.path
+
+    def _prime_udc(self, udc):
+        """Bind a trivial configfs gadget to *udc*, then unbind it.
+
+        A function-less configuration is enough: the point is running the
+        UDC through a complete composite-driver start/stop cycle, not
+        presenting anything to the host. Runs via shell (with sudo fallback)
+        because it must work even while another process interferes with
+        configfs -- direct syscalls raced once and silently failed.
+        """
+        base = GADGET_PATH
+        self._log(f"Priming UDC {udc} via a configfs bind/unbind cycle...")
+        last_exc = None
+        for _ in range(2):
+            try:
+                self._shell(f"mkdir -p {shlex.quote(base)}")
+                self._shell(f"echo 0x1d6b > {shlex.quote(base + '/idVendor')}")
+                self._shell(f"echo 0x0104 > {shlex.quote(base + '/idProduct')}")
+                self._shell(f"echo 0x0200 > {shlex.quote(base + '/bcdUSB')}")
+                self._shell(f"mkdir -p {shlex.quote(base + '/configs/c.1')}")
+                # No function: an empty configuration binds fine.
+                self._shell(f"echo {shlex.quote(udc)} > "
+                            f"{shlex.quote(base + '/UDC')}")
+                time.sleep(0.6)
+                self._shell(f"echo > {shlex.quote(base + '/UDC')}")
+                deadline = time.time() + 3.0
+                while time.time() < deadline:
+                    try:
+                        if self._read(f"{base}/UDC").strip() == "":
+                            break
+                    except OSError:
+                        break
+                    time.sleep(0.1)
+                self._purge_tree(base)
+                self._log("UDC prime cycle complete.")
+                return
+            except Exception as exc:
+                last_exc = exc
+                self._log(f"prime attempt failed ({exc}); retrying...")
+                self._cleanup_stale_configfs()
+                time.sleep(0.5)
+        raise GadgetError(f"UDC prime cycle failed: {last_exc}")
 
     def _build_hid_gadget(self):
         """Standard HID gamepad via the kernel's f_hid function.

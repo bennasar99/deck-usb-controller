@@ -2,15 +2,17 @@
 
 Turn any **Steam Deck** into a **wired game controller** for a PC connected
 over USB-C. Launch the app from Game Mode as a non-Steam game: a small window
-opens, and the Deck's sticks, triggers, buttons and D-pad are forwarded over
-the USB link to the host PC.
+opens with a **mode selector** (Auto / XInput / HID), and the Deck's sticks,
+triggers, buttons and D-pad are forwarded over the USB link to the host PC.
 
-The app picks the protocol per host automatically:
+| Mode | Behavior |
+|------|----------|
+| **Auto** (default) | Native **XInput** (Xbox 360 pad, `045E:028E`) via FunctionFS on Linux hosts; on Windows — which ignores emulated Xbox pads — the app probes, retries once, then switches itself to a **standard USB HID gamepad** (`f_hid`, `/dev/hidg0`) that Steam Input maps for modern games. |
+| **XInput** | Forces the Xbox 360 gadget (FunctionFS). Native XInput on Linux hosts. |
+| **HID** | Forces the standard HID gamepad — pair it with the Windows bridge app (`windows/deck2xinput.exe`, ViGEmBus) for native XInput on Windows. |
 
-| Host | Protocol | How it works |
-|------|----------|--------------|
-| Linux / Steam Machine PCs | **Native XInput** (Xbox 360 pad, `045E:028E`) via FunctionFS | The kernel `xpad` driver binds and consumes reports immediately. |
-| Windows PCs | Ignores emulated Xbox 360 pads lacking hardware-authentic descriptors → after one automatic retry the app switches to a **standard USB HID gamepad** (`f_hid`, `/dev/hidg0`) | Every OS maps plain HID out of the box; Steam Input converts it for modern games. |
+The selection is remembered (written to `~/usb-gamepad-mode`) and applied
+immediately — switching takes ~2 s, no relaunch needed.
 
 > Requires the Deck's USB-C port to be in **DRD (Dual Role Device)** mode in
 > the BIOS. See [INSTALL.md](./INSTALL.md).
@@ -20,67 +22,48 @@ The app picks the protocol per host automatically:
 Game Mode processes cannot run as root, so the app is split in two:
 
 1. **The "game"** (`/opt/usb-gamepad/usb_gamepad`, compiled from
-   `usb_gamepad_launcher.c`) runs as the `deck` user. It is the running app that
-   keeps Steam Input's virtual gamepad alive, shows a small X11 window, and
+   `usb_gamepad_launcher.c`) runs as the `deck` user. It shows the app window
+   (mode buttons + status), keeps Steam Input's virtual gamepad alive, and
    keeps a marker file (`/home/deck/usb-gamepad-active`) fresh while it runs.
 2. **A root daemon** (`usb_gamepad.py`, a systemd service enabled at boot)
-   watches the marker. When the game runs it brings up the controller gadget,
+   watches the marker. When the game runs it brings up the selected gadget,
    reads Steam's virtual pad and forwards reports to the PC. When the game
    closes it tears the gadget down and the Deck returns to normal USB.
 
 ### Protocol selection
 
-* XInput mode starts first. If the host configures the device but never
-  consumes a report, the daemon re-enumerates once (cable-replug equivalent),
-  then switches permanently (for that session) to HID compatibility mode.
-* The raw_gadget backend (`backend/xinput_raw.py`, byte-exact Xbox 360
-  emulation including vendor descriptors) activates automatically whenever a
-  kernel allows raw_gadget on the Deck's USB-C controller; current SteamOS
-  builds reject it at `USB_RAW_IOCTL_RUN` (verified against the dwc3 UDC),
-  so FunctionFS serves XInput until that changes.
-
-```
-+-------------------------+        +--------------------------+
-| Steam Deck (Game Mode)  |  USB-C | PC                        |
-|                         |  DRD   |                           |
-|  usb_gamepad (window +  |        |  Native XInput driver     |
-|  marker file)           |        |  (xusb/xpad)              |
-|    │ marker fresh       |        |  ▲                        |
-|    ▼                    |        |  │ input reports          |
-|  usb_gamepad.py daemon  ├────────┤  │ (20 bytes each)        |
-|    │ (root, systemd)    │ /dev/  │  │                        |
-|    │ reads evdev        │ ffs-*  │  │                        |
-|    ▼                    │        │  │                        |
-|  USB gadget             │        │  │                        |
-|  (FunctionFS, dwc3 DRD) ─────────┘                          |
-+-------------------------+        +--------------------------+
-```
-
-- The gadget setup finds the AMD DWC3 USB controller, re-binds it from the host
-  (`xhci_hcd`) driver to the gadget (`dwc3-pci`) driver and builds a configfs
-  USB gadget with a **FunctionFS** function presenting the exact vendor-specific
-  layout of a wired Xbox 360 pad (VID `0x045E`, PID `0x028E`; interface class
-  `0xFF/0x5D`) — hosts load their native XInput driver automatically.
-- The daemon reads the chosen input device (`/dev/input/event*`) with a small
-  dependency-free evdev reader, rebuilds the 20-byte XInput report on every
-  state change and writes it to the FunctionFS IN endpoint.
+* **Auto**: XInput starts first. If the host configures the device but never
+  consumes a report (with inputs actively flowing), the daemon re-enumerates
+  once (cable-replug equivalent), then switches permanently (for that session)
+  to HID compatibility mode.
+* **XInput**: FunctionFS serves the Xbox 360 pad. A `raw_gadget` backend
+  (`backend/xinput_raw.py`, byte-exact emulation incl. vendor descriptors)
+  exists and would deliver full XInput to Windows, but current SteamOS
+  kernels reject raw_gadget on the Deck's USB-C controller
+  (`USB_RAW_IOCTL_RUN` → EBUSY; verified and documented in `AGENTS.md`),
+  so it is dormant: opt in with `/opt/usb-gamepad/try-raw`.
+* **HID**: `f_hid` presents a generic gamepad (`0079:0006`) with a
+  vendor-defined top-level usage — invisible to games, consumed only by the
+  Windows bridge — with the D-pad encoded as button bits to avoid host
+  hat-switch heuristics.
 
 ## Files
 
-| Path                  | Role                                                            |
-|-----------------------|-----------------------------------------------------------------|
-| `usb_gamepad_launcher.c` | Native launcher "game": X11 window + marker file, no root.  |
-| `usb_gamepad.py`      | Root forwarder daemon (systemd service); protocol watchdog.     |
+| Path | Role |
+|------|------|
+| `usb_gamepad_launcher.c` | Native launcher "game": X11 window (mode buttons, OLED blanking) + marker file, no root. |
+| `usb_gamepad.py` | Root forwarder daemon (systemd service); protocol watchdog. |
 | `install-usb-gamepad.sh` | Installs to `/opt/usb-gamepad`, compiles the launcher, installs the service. |
-| `backend/controller.py` | State, input→report forwarding logic (XInput + HID formats).  |
-| `backend/gadget_manager.py` | Gadget lifecycle: FunctionFS XInput + f_hid HID modes.    |
-| `backend/xinput_ffs.py`   | User-space Xbox 360 controller on FunctionFS.               |
-| `backend/xinput_raw.py`   | raw_gadget XInput backend (auto-activates when supported).  |
-| `backend/xinput_report.py` | Xbox 360 wire format: report builder + parsing.           |
-| `backend/gamepad_report.py` | Standard HID gamepad descriptor + 13-byte reports.       |
-| `backend/evdev_reader.py` | Pure-Python evdev device reading and discovery.             |
-| `INSTALL.md`          | Complete installation guide for any Steam Deck.                 |
-| `tests/`              | Report/descriptor unit tests.                                   |
+| `backend/controller.py` | State, input→report forwarding (XInput + HID formats), per-source Y normalization. |
+| `backend/gadget_manager.py` | Gadget lifecycle: FunctionFS XInput + f_hid HID modes, raw_gadget hook. |
+| `backend/xinput_ffs.py` | User-space Xbox 360 controller on FunctionFS. |
+| `backend/xinput_raw.py` | raw_gadget XInput backend (opt-in via `/opt/usb-gamepad/try-raw`). |
+| `backend/xinput_report.py` | Xbox 360 wire format: report builder + rumble/LED parsing. |
+| `backend/gamepad_report.py` | HID gamepad descriptor (vendor usage) + 12-byte reports. |
+| `backend/evdev_reader.py` | Pure-Python evdev device reading and discovery. |
+| `windows/` | `deck2xinput.exe` source: HID → ViGEmBus XInput bridge for Windows (ViGEmClient SDK vendored). |
+| `tests/test_report.py` | Unit tests (run: `python tests/test_report.py`). |
+| `AGENTS.md` | Repo status, investigation history, gotchas — for humans and agents. |
 
 ## Installation
 
@@ -96,33 +79,38 @@ Full guide in [INSTALL.md](./INSTALL.md). Quick start:
 
 1. Connect the Deck to the PC with a data-capable USB-C cable.
 2. Launch the "USB Gamepad" game from your Steam library.
-3. The PC sees a controller within seconds (Xbox 360 pad on Linux; after a
-   ~15 s probe, a standard gamepad on Windows). Play!
-4. **OLED burn-in protection**: the app window goes fully black after 10 s
-   without input — intentional, to protect the Deck's OLED panel during long
-   sessions. Touch the screen (or move a finger on it) and it returns to
-   normal instantly. Forwarding keeps running while blacked out.
+3. Pick a mode in the window (or stay on **Auto**). The PC sees a controller
+   within seconds on Linux; on Windows expect the ~15 s probe, then a
+   re-enumeration into HID mode (run `windows/deck2xinput.exe` there for
+   native XInput).
+4. **OLED burn-in protection**: the window goes fully black after 10 s
+   without input. Touch the screen to wake it; forwarding keeps running
+   while blacked out.
 5. Close the "game" to stop and restore the Deck's normal USB port.
 
 ## Logs & troubleshooting
 
 All messages land in `/home/deck/usb-gamepad.log`; the daemon's output is also
-in the journal (`journalctl -u usb-gamepad -f`). Common issues:
+in the journal (`journalctl -u usb-gamepad -f`). The periodic `Status:` line
+decodes the live controller state (`buttons`/`hat` or `lt`/`rt`/sticks).
+Common issues:
 
-- **Steam loading screen stays** — `libx11` was missing when the installer ran
-  (headless build). Install `libx11` and re-run the installer.
-- **`No UDC`** — the USB-C port is not in DRD mode. Set **USB Dual Role Device**
-  to **DRD** in the BIOS (Volume Up + Power).
-- **`Switching to HID compatibility mode`** on Windows — expected behaviour:
-  Windows' driver stack requires hardware-authentic descriptors that emulated
-  Xbox 360 pads cannot present through FunctionFS, so the app switches to a
-  standard HID gamepad it maps natively. Wait for
-  `HID gamepad ready (/dev/hidg0)` in the log (~15 s after launch).
-- **No input anywhere** — check the log shows `Reading Microsoft X-Box 360 pad
-  0 (...)`, that Steam is focused in Game Mode, and that only one instance of
-  the app runs (`systemctl status usb-gamepad`).
+- **Headless launcher / no window** — `libx11` was missing when the installer
+  ran. Install `libx11` and re-run the installer.
+- **`No UDC`** — the USB-C port is not in DRD mode. Set **USB Dual Role
+  Device** to **DRD** in the BIOS (Volume Up + Power).
+- **`Switching to HID compatibility mode`** on Windows — expected in Auto
+  mode (Windows can't drive emulated Xbox pads through FunctionFS). Wait for
+  `HID gamepad ready (/dev/hidg0)`, then start `deck2xinput.exe` on the PC.
+- **No input anywhere** — the log must show `Reading Microsoft X-Box 360 pad
+  0 (...)` and climbing `input_events=`; Steam Input only feeds the virtual
+  pad while the game has Game Mode focus.
+- **Mode buttons don't respond to taps** — check you're running the X11
+  build (`Launcher built with an X11 window` during install) and not the
+  headless fallback.
 
-See [INSTALL.md](./INSTALL.md) for the full troubleshooting table.
+See [INSTALL.md](./INSTALL.md) for the full troubleshooting table and
+[windows/README.md](./windows/README.md) for the Windows bridge.
 
 ## License
 

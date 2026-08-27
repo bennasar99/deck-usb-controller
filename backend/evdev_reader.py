@@ -144,6 +144,7 @@ class EvdevDevice:
             self.vendor, self.product = self._read_id()
             self.caps = self._read_caps()
             self.absinfo = self._read_absinfo()
+            self.kind = self.describe()["kind"]
         except Exception:
             os.close(self.fd)
             raise

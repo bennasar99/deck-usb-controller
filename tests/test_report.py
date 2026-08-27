@@ -24,7 +24,7 @@ from backend import evdev_reader
 from backend import xinput_ffs
 from backend.gamepad_report import (
     build_report_descriptor, HidGamepadReport,
-    HAT_UP, HAT_UP_LEFT, REPORT_LENGTH,
+    DPAD_UP as HID_DPAD_UP, DPAD_LEFT as HID_DPAD_LEFT, REPORT_LENGTH,
 )
 
 
@@ -255,19 +255,24 @@ def test_build_hid_frame():
         evdev_reader.ABS_RZ: 0,
     }
     frame = build_hid_frame(reader, state)
-    assert len(frame) == REPORT_LENGTH == 13
-    assert struct.unpack_from("<H", frame, 0)[0] & 0x0001, "A pressed"
-    assert struct.unpack_from("<H", frame, 0)[0] & 0x0080, "start pressed"
-    assert frame[2] == HAT_UP_LEFT, "hat up-left diagonal"
-    assert frame[3] == 128, "left trigger forwarded"
-    lx = struct.unpack_from("<h", frame, 5)[0]
+    assert len(frame) == REPORT_LENGTH == 12
+    buttons = struct.unpack_from("<H", frame, 0)[0]
+    assert buttons & 0x0001, "A pressed"
+    assert buttons & 0x0080, "start pressed"
+    assert buttons & HID_DPAD_UP and buttons & HID_DPAD_LEFT, "up-left diagonal"
+    assert frame[2] == 128, "left trigger forwarded"
+    lx = struct.unpack_from("<h", frame, 4)[0]
     assert lx > 0, "left stick pushed right"
 
 
 def test_hid_report_descriptor():
     desc = build_report_descriptor()
-    assert desc[0] == 0x05 and desc[-1] == 0xC0
-    # 16 buttons + hat + triggers + 4 stick axes must sum to 13 bytes.
+    # Vendor-defined top-level usage page (0xFF00): games must not see the
+    # raw feed as a second gamepad; only the deck2xinput bridge reads it.
+    assert desc[0] == 0x06 and desc[1:3] == bytes([0x00, 0xFF])
+    assert desc[3] == 0x09 and desc[4] == 0x01   # Usage (1)
+    assert desc[-1] == 0xC0
+    # 15 buttons (incl. 4 D-pad bits) + triggers + 4 stick axes = 12 bytes.
     report = HidGamepadReport()
     report.set_button(0x0001, True)
     report.set_hat(up=True)
@@ -275,10 +280,10 @@ def test_hid_report_descriptor():
     report.set_stick(0, -3000, 4000)
     frame = report.to_bytes()
     assert len(frame) == REPORT_LENGTH
-    assert struct.unpack_from("<H", frame, 0)[0] == 0x0001
-    assert frame[2] == HAT_UP
-    assert frame[4] == 200
-    ly = struct.unpack_from("<h", frame, 7)[0]
+    buttons = struct.unpack_from("<H", frame, 0)[0]
+    assert buttons & 0x0001 and buttons & HID_DPAD_UP
+    assert frame[3] == 200
+    ly = struct.unpack_from("<h", frame, 6)[0]
     assert ly > 0
 
 

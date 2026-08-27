@@ -277,9 +277,77 @@ class GamepadController:
             pass
 
 
+def _source_y_sign(reader):
+    """Per-source stick-Y polarity normalizer.
+
+    The Steam Deck's raw built-in controller (hid-steam) reports stick Y
+    with the Steam-controller convention (up = positive), while Steam's
+    virtual pad and standard xpad-style devices use up = negative. The
+    daemon auto-refreshes its source when the current one goes quiet, so
+    without this correction the emitted Y polarity would FLIP depending on
+    which source was active (observed as the invert "undoing itself").
+    """
+    return -1.0 if getattr(reader, "kind", "") == "deck-builtin" else 1.0
+
+
 def build_xinput_frame(reader, state):
     """Rebuild the 20-byte XInput report from the current evdev state."""
     report = XInputReport()
+    sign = _source_y_sign(reader)
+    _fill_xinput(report, reader, state, sign)
+    return report.to_bytes()
+
+
+def build_hid_frame(reader, state):
+    """Rebuild the 12-byte HID gamepad report from the current evdev state.
+
+    Used by the HID compatibility gadget (GadgetManager mode 'hid'); the
+    button/D-pad/axis semantics match the XInput path one-to-one.
+    """
+    from backend.gamepad_report import (
+        BTN_A as H_A, BTN_B as H_B, BTN_X as H_X, BTN_Y as H_Y,
+        BTN_LB as H_LB, BTN_RB as H_RB,
+        BTN_BACK as H_BACK, BTN_START as H_START,
+        BTN_LS as H_LS, BTN_RS as H_RS, BTN_GUIDE as H_GUIDE,
+        GamepadReport,
+    )
+    hid_bits = {
+        A: H_A, B: H_B, X: H_X, Y: H_Y,
+        LB: H_LB, RB: H_RB, BACK: H_BACK, START: H_START,
+        L3: H_LS, R3: H_RS, GUIDE: H_GUIDE,
+    }
+
+    hat_x = state.get(evdev_reader.ABS_HAT0X, 0)
+    hat_y = state.get(evdev_reader.ABS_HAT0Y, 0)
+
+    report = GamepadReport()
+    for code, xinput_flag in _BUTTON_MAP.items():
+        hid_flag = hid_bits.get(xinput_flag)
+        if hid_flag is not None and state.get(code):
+            report.set_button(hid_flag, True)
+    report.set_hat(
+        up=hat_y == -1, down=hat_y == 1,
+        left=hat_x == -1, right=hat_x == 1,
+    )
+
+    sign = _source_y_sign(reader)
+    report.set_stick(0,
+                     _to_stick(_read_axis(reader, state, evdev_reader.ABS_X, _STICK_DEADZONE)),
+                     _to_stick(sign * _read_axis(reader, state, evdev_reader.ABS_Y, _STICK_DEADZONE)))
+    report.set_stick(1,
+                     _to_stick(_read_axis(reader, state, evdev_reader.ABS_RX, _STICK_DEADZONE)),
+                     _to_stick(sign * _read_axis(reader, state, evdev_reader.ABS_RY, _STICK_DEADZONE)))
+    report.set_trigger(0, _to_trigger(_read_axis(
+        reader, state, _pick_axis(reader, evdev_reader.ABS_Z, evdev_reader.ABS_HAT2Y),
+        _TRIGGER_DEADZONE)))
+    report.set_trigger(1, _to_trigger(_read_axis(
+        reader, state, _pick_axis(reader, evdev_reader.ABS_RZ, evdev_reader.ABS_HAT2X),
+        _TRIGGER_DEADZONE)))
+    return report.to_bytes()
+
+
+def _fill_xinput(report, reader, state, y_sign):
+    """Fill an XInputReport from the current evdev state."""
     for code, flag in _BUTTON_MAP.items():
         if state.get(code):
             report.set_button(flag, True)
@@ -297,10 +365,10 @@ def build_xinput_frame(reader, state):
 
     report.set_stick(0,
                      _to_stick(_read_axis(reader, state, evdev_reader.ABS_X, _STICK_DEADZONE)),
-                     _to_stick(_read_axis(reader, state, evdev_reader.ABS_Y, _STICK_DEADZONE)))
+                     _to_stick(y_sign * _read_axis(reader, state, evdev_reader.ABS_Y, _STICK_DEADZONE)))
     report.set_stick(1,
                      _to_stick(_read_axis(reader, state, evdev_reader.ABS_RX, _STICK_DEADZONE)),
-                     _to_stick(_read_axis(reader, state, evdev_reader.ABS_RY, _STICK_DEADZONE)))
+                     _to_stick(y_sign * _read_axis(reader, state, evdev_reader.ABS_RY, _STICK_DEADZONE)))
     # Triggers: the virtual gamepad exposes ABS_Z/ABS_RZ (0..255) while the
     # raw built-in controller exposes ABS_HAT2Y/ABS_HAT2X (0..32767).
     report.set_trigger(0, _to_trigger(_read_axis(
@@ -309,7 +377,6 @@ def build_xinput_frame(reader, state):
     report.set_trigger(1, _to_trigger(_read_axis(
         reader, state, _pick_axis(reader, evdev_reader.ABS_RZ, evdev_reader.ABS_HAT2X),
         _TRIGGER_DEADZONE)))
-    return report.to_bytes()
 
 
 def build_hid_frame(reader, state):

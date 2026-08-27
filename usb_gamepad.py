@@ -22,8 +22,10 @@ Install:  ./install-usb-gamepad.sh
 Add /opt/usb-gamepad/usb_gamepad to Steam as a non-Steam game.
 """
 
+import fcntl
 import os
 import signal
+import struct
 import sys
 import time
 
@@ -38,6 +40,22 @@ DECK_HOME = "/home/deck" if os.path.isdir("/home/deck") else os.path.expanduser(
 LOG_FILE = os.path.join(DECK_HOME, "usb-gamepad.log")
 MARKER_FILE = os.path.join(DECK_HOME, "usb-gamepad-active")
 MARKER_STALE_SECS = 5.0
+# User-selected controller protocol, written by the launcher UI
+# ("auto" | "xinput" | "hid"). "auto" = XInput first, automatic HID
+# fallback when the host ignores it.
+MODE_FILE = os.path.join(DECK_HOME, "usb-gamepad-mode")
+
+
+def read_mode():
+    """Read the user-selected mode; 'auto' when absent or unrecognized."""
+    try:
+        with open(MODE_FILE, "r") as handle:
+            value = handle.read(16).strip().lower()
+        if value in ("auto", "xinput", "hid"):
+            return value
+    except OSError:
+        pass
+    return "auto"
 
 
 def log(msg):
@@ -84,11 +102,34 @@ def _shutdown(_signum=None, _frame=None):
     _stop = True
 
 
+def _acquire_singleton():
+    """Ensure only one daemon instance runs.
+
+    Multiple concurrent instances race each other on configfs (observed as
+    random EACCES during gadget setup and mysterious double-starts under
+    `systemctl restart`), so hold an exclusive flock for our lifetime.
+    """
+    lock_path = "/run/usb-gamepad.lock" if os.path.isdir("/run") \
+        else os.path.join(DECK_HOME, "usb-gamepad.lock")
+    handle = open(lock_path, "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        log("Another usb_gamepad daemon instance is already running; "
+            "exiting.")
+        return None
+    return handle
+
+
 def main():
     global _stop
     manager = GadgetManager(logger=log, sudo=False)
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
+    lock_handle = _acquire_singleton()
+    if lock_handle is None:
+        return 0
 
     gadget_up = False
     reader = None
@@ -103,11 +144,12 @@ def main():
     prev_polls = 0
     prev_polls_since = time.time()
     resets_done = 0
-    switched_to_hid = False
     hid_recoveries = 0
+    applied_wanted = read_mode()      # mode selection applied to the gadget
+    switched_to_hid = False           # auto-mode XInput->HID switch happened
 
-    log("USB XInput controller daemon started (build 2026-08-xinput-ffs); "
-        "waiting for the 'USB Gamepad' game.")
+    log("USB XInput controller daemon started (build 2026-08-xinput-ffs, "
+        "mode=%s); waiting for the 'USB Gamepad' game." % applied_wanted)
     try:
         while not _stop:
             if not marker_fresh():
@@ -127,13 +169,15 @@ def main():
 
             if not gadget_up:
                 try:
-                    mode = "hid" if switched_to_hid else "xinput"
+                    mode = "hid" if (applied_wanted == "hid"
+                                     or switched_to_hid) else "xinput"
                     log("Setting up USB %s controller..." %
-                        ("HID (compatibility)" if switched_to_hid
+                        ("HID (compatibility)" if mode == "hid"
                          else "Xbox 360 (XInput)"))
                     manager.start(mode=mode)
                     gadget_up = True
-                    log("USB gadget ready (%s)" % manager.path)
+                    log("USB gadget ready (%s) [mode=%s, selection=%s]"
+                        % (manager.path, manager.mode, applied_wanted))
                 except Exception as exc:
                     log("ERROR: USB gadget setup failed: %s" % exc)
                     try:
@@ -168,11 +212,53 @@ def main():
                 reader = None
                 continue
             now = time.time()
+            # Manual mode selection from the launcher UI: switching between
+            # explicit modes (or back to auto) restarts the gadget.
+            wanted = read_mode()
+            if gadget_up and wanted != applied_wanted:
+                log("Controller mode selection changed: %s -> %s; "
+                    "restarting gadget..." % (applied_wanted, wanted))
+                applied_wanted = wanted
+                switched_to_hid = False
+                gadget_up = False
+                reader = None
+                state = {}
+                last_frame = b""
+                pending = b""
+                delivered_gadget_up = False
+                prev_polls = 0
+                prev_polls_since = now
+                resets_done = 0
+                hid_recoveries = 0
+                try:
+                    manager.stop()
+                except Exception as exc:
+                    log("teardown during mode switch failed: %s" % exc)
+                manager = GadgetManager(logger=log, sudo=False)
+                time.sleep(1.0)
+                continue
             if gadget_up and now - last_stats >= 15.0:
                 last_stats = now
-                log("Status: input_events=%d polls=%s errors=%s%s" % (
+                extra = ""
+                if pending and len(pending) >= 12:
+                    buttons = struct.unpack_from("<H", pending, 0)[0]
+                    lt, rt = pending[2], pending[3]
+                    sticks = struct.unpack_from("<hhhh", pending, 4)
+                    if manager.mode == "hid":
+                        fmt = ("hid: buttons=0x%04x lt=%d rt=%d "
+                               "L(%d,%d) R(%d,%d)")
+                        vals = (buttons, lt, rt) + sticks
+                    else:
+                        fmt = ("xinput: buttons=0x%04x lt=%d rt=%d "
+                               "L(%d,%d) R(%d,%d)")
+                        vals = (struct.unpack_from("<H", pending, 2)[0],
+                                pending[4], pending[5],
+                                ) + struct.unpack_from("<hhhh", pending, 6)
+                    extra = " | " + (fmt % vals)
+                log("Status: input_events=%d polls=%s errors=%s%s%s" % (
                     ev_count, manager.polls, manager.errors,
-                    "" if manager.enabled else " [host not configured yet]"))
+                    "" if manager.enabled else " [host not configured yet]",
+                    extra))
             if event is None:
                 if now - last_event > 2.0:
                     new_path = pick_device()
@@ -199,7 +285,7 @@ def main():
                     state[code] = value
                 elif ev_type == evdev_reader.EV_SYN:
                     pending = (build_hid_frame(reader, state)
-                               if switched_to_hid
+                               if manager.mode == "hid"
                                else build_xinput_frame(reader, state))
 
             # Delivery is decoupled from event building: ep1 writes block
@@ -217,7 +303,7 @@ def main():
             if manager.polls > prev_polls:
                 if not delivered_gadget_up:
                     delivered_gadget_up = True
-                    kind = ("HID" if switched_to_hid else "XInput")
+                    kind = ("HID" if manager.mode == "hid" else "XInput")
                     log("First %s report consumed by the host (polls=%s). "
                         "The PC should now show a working controller."
                         % (kind, manager.polls))
@@ -227,7 +313,7 @@ def main():
                   and now - last_event < 15.0
                   and now - prev_polls_since > 8.0):
                 prev_polls_since = now   # rate-limit recovery to 1 / 8 s
-                if not switched_to_hid:
+                if manager.mode == "xinput" and applied_wanted == "auto":
                     resets_done += 1
                     if resets_done == 1:
                         # Host configured us but never consumes reports --
@@ -256,10 +342,17 @@ def main():
                             manager.stop()
                         except Exception as exc:
                             log("teardown during mode switch failed: %s" % exc)
-                        # Fresh manager + grace period so the previous
-                        # gadget's kernel state is fully gone.
                         manager = GadgetManager(logger=log, sudo=False)
                         time.sleep(1.0)
+                elif manager.mode == "xinput":
+                    # User forced XInput: recover once, then stay put —
+                    # switching protocols was explicitly disabled.
+                    if resets_done == 0:
+                        resets_done = 1
+                        try:
+                            manager.reset_device()
+                        except Exception as exc:
+                            log("re-enumeration failed: %s" % exc)
                 else:
                     # HID delivery stalled while inputs flow: restart the HID
                     # gadget at most twice, then stay quiet (the controller
