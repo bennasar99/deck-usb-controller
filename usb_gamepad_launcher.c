@@ -76,6 +76,8 @@ static void write_mode(int mode) {
 }
 
 #define BT_FLAG_PATH "/home/deck/usb-gamepad-bt"
+#define BOND_PATH    "/home/deck/usb-gamepad-bt-bond"
+#define UNPAIR_PATH  "/home/deck/usb-gamepad-bt-unpair"
 
 static int read_bt_enabled(void) {
     FILE *f = fopen(BT_FLAG_PATH, "r");
@@ -102,6 +104,36 @@ static int slen(const char *s) {
     while (s[n])
         n++;
     return n;
+}
+
+static void trim_eol(char *s) {
+    int n = slen(s);
+    while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r'))
+        s[--n] = '\0';
+}
+
+/* Build a short label for the saved Bluetooth PC bond. First line of the
+ * bond file is the address, the second is the display name. */
+static void read_bond_label(char *out, int cap) {
+    char addr[64] = {0};
+    char name[64] = {0};
+    FILE *f = fopen(BOND_PATH, "r");
+    out[0] = '\0';
+    if (!f)
+        return;
+    if (!fgets(addr, sizeof addr, f)) {
+        fclose(f);
+        return;
+    }
+    if (!fgets(name, sizeof name, f))
+        name[0] = '\0';
+    fclose(f);
+    trim_eol(addr);
+    trim_eol(name);
+    if (name[0])
+        snprintf(out, cap, "Paired PC: %s", name);
+    else if (addr[0])
+        snprintf(out, cap, "Paired PC: %s", addr);
 }
 
 static void log_msg(const char *msg);   /* defined below main helpers */
@@ -175,6 +207,9 @@ static UiButton g_buttons[3] = {
     { 430, 150, 180, 46, "HID" },
 };
 
+/* Forgets the bonded PC in BlueZ via the daemon (writes UNPAIR_PATH). */
+static UiButton g_unpair_btn = { 30, 280, 280, 44, "Unpair PC" };
+
 static int ignore_xerror(Display *d, void *e) {
     (void)d;
     (void)e;
@@ -241,10 +276,32 @@ static void draw(void) {
                         bt_label, slen(bt_label));
         }
 
+        /* Unpair button (forgets the bonded PC in BlueZ) + saved bond label. */
+        {
+            char bond[80];
+            const int uw = slen(g_unpair_btn.label) * 9;
+            read_bond_label(bond, sizeof bond);
+            XSetForeground(dpy, gc, 0x313244);
+            XFillRectangle(dpy, win, gc, g_unpair_btn.x, g_unpair_btn.y,
+                           g_unpair_btn.w, g_unpair_btn.h);
+            XSetForeground(dpy, gc, 0xF38BA8);
+            XDrawRectangle(dpy, win, gc, g_unpair_btn.x, g_unpair_btn.y,
+                           g_unpair_btn.w, g_unpair_btn.h);
+            XDrawString(dpy, win, gc,
+                        g_unpair_btn.x + (g_unpair_btn.w - uw) / 2,
+                        g_unpair_btn.y + 28, g_unpair_btn.label,
+                        slen(g_unpair_btn.label));
+            if (bond[0]) {
+                XSetForeground(dpy, gc, 0xA6ADB0);
+                XDrawString(dpy, win, gc, 330, g_unpair_btn.y + 28,
+                            bond, slen(bond));
+            }
+        }
+
         XSetForeground(dpy, gc, 0x6C7086);
-        XDrawString(dpy, win, gc, 20, 320,
+        XDrawString(dpy, win, gc, 20, 360,
                     "Screen blanks after 10 s (touch to wake)", 40);
-        XDrawString(dpy, win, gc, 20, 350,
+        XDrawString(dpy, win, gc, 20, 390,
                     "Close this game to stop", 23);
     }
     XFlush(dpy);
@@ -340,6 +397,19 @@ static void pump_window(void) {
                     log_msg(read_bt_enabled()
                             ? "usb_gamepad: Bluetooth enabled."
                             : "usb_gamepad: Bluetooth disabled.");
+                    handled = 1;
+                }
+                if (!handled &&
+                    cx >= g_unpair_btn.x &&
+                    cx < g_unpair_btn.x + g_unpair_btn.w &&
+                    cy >= g_unpair_btn.y &&
+                    cy < g_unpair_btn.y + g_unpair_btn.h) {
+                    FILE *uf = fopen(UNPAIR_PATH, "w");
+                    if (uf) {
+                        fputs("1", uf);
+                        fclose(uf);
+                    }
+                    log_msg("usb_gamepad: Unpair PC requested.");
                     handled = 1;
                 }
                 (void)handled;

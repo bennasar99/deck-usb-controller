@@ -12,7 +12,7 @@ triggers, buttons and D-pad are forwarded over the USB link to the host PC.
 | **HID** | Forces the standard HID gamepad — pair it with the Windows bridge app (`windows/deck2xinput.exe`, ViGEmBus) for native XInput on Windows. |
 
 | **HID** | Forces the standard HID gamepad — pair it with the Windows bridge app (`windows/deck2xinput.exe`, ViGEmBus) for native XInput on Windows. |
-| **Bluetooth** (toggle) | Independent of the USB modes: advertises the Deck as a BLE HID gamepad ("SteamDeckPad"). Pair it from the PC's Bluetooth settings — Windows 10+ maps it natively, Steam Input refines it. |
+| **Bluetooth** (toggle) | Independent of the USB modes: advertises the Deck as a BLE HID gamepad ("SteamDeckPad"). Pair it from the PC's Bluetooth settings — Windows 10+ maps it natively, Steam Input refines it. The paired PC is remembered (`~/usb-gamepad-bt-bond`) and reconnects after reboots; use the window's **Unpair PC** button to forget it. |
 
 The selection is remembered (written to `~/usb-gamepad-mode` and
 `~/usb-gamepad-bt`) and applied immediately — switching takes ~2 s, no

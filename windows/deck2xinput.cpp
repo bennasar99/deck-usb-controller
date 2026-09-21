@@ -87,6 +87,7 @@
 
 static volatile LONG g_run = 1;
 static int g_debug = 0;
+static int g_list = 0;
 static int g_invert_y = 1;   // default ON; --no-invert-y / env opt-out
 
 static int rd_i16(const unsigned char *p, int off) {
@@ -215,13 +216,14 @@ static bool contains_ci(const std::wstring &hay, const wchar_t *needle) {
     return h.find(n) != std::wstring::npos;
 }
 
-static bool IsOurFeed(HANDLE handle, HIDP_CAPS &caps) {
+static bool IsOurFeed(HANDLE handle, HIDP_CAPS &caps, const char **kind) {
     HIDD_ATTRIBUTES attr;
     attr.Size = sizeof(attr);
     if (!HidD_GetAttributes(handle, &attr))
         return false;
     if (attr.VendorID == DECK_VID && attr.ProductID == DECK_PID) {
         // USB gadget (or BLE device exposing the same PnP ID).
+        *kind = "hid(0079:0006)";
         PHIDP_PREPARSED_DATA pp = nullptr;
         bool ok = false;
         if (HidD_GetPreparsedData(handle, &pp)) {
@@ -235,11 +237,14 @@ static bool IsOurFeed(HANDLE handle, HIDP_CAPS &caps) {
         }
         return ok;
     }
-    // Bluetooth: the BLE HID device may report a different VID/PID, but its
-    // product string is always the advertisement name "SteamDeckPad".
+    // Fallback for devices that do expose a product string. NOTE: BLE HID
+    // devices do NOT -- Windows returns an empty product string for them, so
+    // Bluetooth matching relies entirely on the PnP ID's USB VID/PID above
+    // (the reason that ID must use Vendor ID Source 0x02).
     wchar_t product[126];
     if (HidD_GetProductString(handle, product, sizeof(product)) &&
         contains_ci(product, L"SteamDeckPad")) {
+        *kind = "ble(SteamDeckPad)";
         PHIDP_PREPARSED_DATA pp = nullptr;
         bool ok = false;
         if (HidD_GetPreparsedData(handle, &pp)) {
@@ -282,22 +287,99 @@ static size_t FindDeckFeeds(std::vector<HidDevice> &out) {
                                               nullptr, nullptr))
             continue;
 
-        HANDLE h = CreateFileW(detail->DevicePath, GENERIC_READ,
+        // Query-only handle (access 0), like hidapi: BLE HID devices often
+        // reject a GENERIC_READ open, and attributes/caps need no access.
+        HANDLE h = CreateFileW(detail->DevicePath, 0,
                                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                               nullptr, OPEN_EXISTING,
-                               FILE_FLAG_OVERLAPPED, nullptr);
+                               nullptr, OPEN_EXISTING, 0, nullptr);
         if (h == INVALID_HANDLE_VALUE)
             continue;
         HIDP_CAPS caps{};
-        if (IsOurFeed(h, caps))
-            out.push_back({detail->DevicePath,
-                           std::string("hid(0079:0006)")});
+        const char *kind = nullptr;
+        if (IsOurFeed(h, caps, &kind))
+            out.push_back({detail->DevicePath, std::string(kind)});
         CloseHandle(h);
         if (out.size() >= 4)
             break;
     }
     SetupDiDestroyDeviceInfoList(devs);
     return out.size();
+}
+
+static void ListHidDevices(void) {
+    GUID guid;
+    HidD_GetHidGuid(&guid);
+    HDEVINFO devs = SetupDiGetClassDevsW(&guid, nullptr, nullptr,
+                                         DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (devs == INVALID_HANDLE_VALUE) {
+        printf("[!] SetupDiGetClassDevs failed (%lu)\n", GetLastError());
+        return;
+    }
+    SP_DEVICE_INTERFACE_DATA ifdata{};
+    ifdata.cbSize = sizeof(ifdata);
+    printf("HID devices (VID/PID/product/inlen):\n");
+    for (DWORD i = 0;
+         SetupDiEnumDeviceInterfaces(devs, nullptr, &guid, i, &ifdata); ++i) {
+        DWORD needed = 0;
+        SetupDiGetDeviceInterfaceDetailW(devs, &ifdata, nullptr, 0,
+                                         &needed, nullptr);
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || needed == 0)
+            continue;
+        std::vector<unsigned char> buf(needed);
+        auto *detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W *>(
+            buf.data());
+        detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+        if (!SetupDiGetDeviceInterfaceDetailW(devs, &ifdata, detail, needed,
+                                              nullptr, nullptr))
+            continue;
+        HANDLE h = CreateFileW(detail->DevicePath, 0,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) {
+            printf("  (cannot open) %ls\n", detail->DevicePath);
+            continue;
+        }
+        HIDD_ATTRIBUTES attr;
+        attr.Size = sizeof(attr);
+        BOOL haveAttr = HidD_GetAttributes(h, &attr);
+        wchar_t product[126] = L"";
+        wchar_t manuf[126] = L"";
+        HidD_GetProductString(h, product, sizeof(product));
+        HidD_GetManufacturerString(h, manuf, sizeof(manuf));
+        HIDP_CAPS caps{};
+        PHIDP_PREPARSED_DATA pp = nullptr;
+        if (HidD_GetPreparsedData(h, &pp)) {
+            HidP_GetCaps(pp, &caps);
+            HidD_FreePreparsedData(pp);
+        }
+        HIDP_CAPS mcaps{};
+        const char *kind = nullptr;
+        const bool match = IsOurFeed(h, mcaps, &kind);
+        const char *openmode = "rw";
+        HANDLE hr = CreateFileW(detail->DevicePath, GENERIC_READ | GENERIC_WRITE,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                nullptr, OPEN_EXISTING, 0, nullptr);
+        if (hr == INVALID_HANDLE_VALUE) {
+            openmode = "ro";
+            hr = CreateFileW(detail->DevicePath, GENERIC_READ,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             nullptr, OPEN_EXISTING, 0, nullptr);
+        }
+        if (hr == INVALID_HANDLE_VALUE)
+            openmode = "no";
+        else
+            CloseHandle(hr);
+        printf("  VID=%04X PID=%04X usagePage=%04X inlen=%u open=%s match=%s\n",
+               haveAttr ? attr.VendorID : 0,
+               haveAttr ? attr.ProductID : 0,
+               (unsigned)caps.UsagePage,
+               (unsigned)caps.InputReportByteLength,
+               openmode, match ? kind : "-");
+        printf("    product=\"%ls\" manufacturer=\"%ls\"\n", product, manuf);
+        printf("    %ls\n", detail->DevicePath);
+        CloseHandle(h);
+    }
+    SetupDiDestroyDeviceInfoList(devs);
 }
 
 // ---- per-device reader threads ---------------------------------------------
@@ -322,10 +404,17 @@ static void StartSession(const HidDevice &dev) {
     s->tag = dev.tag;
     s->stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
-    HANDLE h = CreateFileW(dev.path.c_str(), GENERIC_READ,
+    // BLE HID devices may require write access to open for I/O; try
+    // read+write first, then fall back to read-only.
+    HANDLE h = CreateFileW(dev.path.c_str(), GENERIC_READ | GENERIC_WRITE,
                            FILE_SHARE_READ | FILE_SHARE_WRITE,
                            nullptr, OPEN_EXISTING,
                            FILE_FLAG_OVERLAPPED, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        h = CreateFileW(dev.path.c_str(), GENERIC_READ,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        nullptr, OPEN_EXISTING,
+                        FILE_FLAG_OVERLAPPED, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
         printf("[!] Cannot open %ls (err %lu)\n",
                dev.path.c_str(), GetLastError());
@@ -341,9 +430,6 @@ static void StartSession(const HidDevice &dev) {
         HidP_GetCaps(pp, &caps);
         HidD_FreePreparsedData(pp);
     }
-    DWORD buflen = caps.InputReportByteLength > REPORT_LENGTH
-                       ? caps.InputReportByteLength : REPORT_LENGTH;
-    (void)buflen;
 
     EnterCriticalSection(&g_sessions_cs);
     s->th = std::thread(ReaderThread, (void *)s);
@@ -421,6 +507,8 @@ int main(int argc, char **argv) {
         const char *a = argv[i];
         if (strcmp(a, "-d") == 0 || strcmp(a, "--debug") == 0)
             g_debug = 1;
+        else if (strcmp(a, "-l") == 0 || strcmp(a, "--list") == 0)
+            g_list = 1;
         else if (strcmp(a, "-i") == 0 || strcmp(a, "--invert-y") == 0)
             g_invert_y = 1;
         else if (strcmp(a, "--no-invert-y") == 0)
@@ -440,6 +528,11 @@ int main(int argc, char **argv) {
            "ViGEmBus XInput%s%s\n",
            g_debug ? " [debug]" : "",
            g_invert_y ? " [invert-y]" : "");
+
+    if (g_list) {
+        ListHidDevices();
+        return 0;
+    }
 
     InitializeCriticalSection(&g_feed_cs);
     InitializeCriticalSection(&g_sessions_cs);

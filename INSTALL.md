@@ -181,6 +181,10 @@ on both devices). Windows 10+ recognizes it as a BLE HID gamepad natively —
 no ViGEmBus or bridge needed. First-time pairing may require a mapping pass
 in the game's/Steam's controller settings.
 
+The paired PC is saved (`~/usb-gamepad-bt-bond`), marked Trusted, and
+reconnects automatically after reboots (no re-pairing). To forget it, click
+**Unpair PC** in the app window — the daemon removes the bond from BlueZ.
+
 ---
 
 ## Logs & troubleshooting

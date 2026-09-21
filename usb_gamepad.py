@@ -179,16 +179,10 @@ def main():
                     bt_retry_after = time.time() + 30.0
                     log("Bluetooth service unavailable (retry in 30 s): %s"
                         % exc)
-                    want_bt = False
-            elif not want_bt and bt_service is not None:
-                try:
-                    from backend.bt_hogp import BtHogpService
-                    bt_service = BtHogpService(logger=log)
-                    bt_service.start()
-                    bt_last = b""
-                    log("Bluetooth enabled; BT HID service started.")
-                except Exception as exc:
-                    log("Bluetooth service unavailable: %s" % exc)
+                    # start() already rolled the instance back (objects
+                    # unregistered, loop stopped), so clear the reference or
+                    # the retry condition below can never become true again.
+                    bt_service = None
                     want_bt = False
             elif not want_bt and bt_service is not None:
                 log("Bluetooth disabled; stopping BT service.")

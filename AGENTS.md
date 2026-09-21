@@ -57,7 +57,7 @@ Key files:
 - `backend/xinput_report.py` / `backend/gamepad_report.py` Ã¢â‚¬â€ wire formats.
 - `backend/controller.py` Ã¢â‚¬â€ `build_xinput_frame` / `build_hid_frame`.
 - `backend/evdev_reader.py` Ã¢â‚¬â€ dependency-free evdev reader.
-- `backend/bt_hogp.py` - BLE HID-over-GATT gamepad (BlueZ D-Bus GATT server + LE advertisement, static BLE address via btmgmt). Opt-in via the launcher `Bluetooth: ON/OFF` toggle (`~/usb-gamepad-bt`); requires python-gobject. BT is independent of the USB modes and keeps forwarding when the game is closed.
+- `backend/bt_hogp.py` - BLE HID-over-GATT gamepad (BlueZ D-Bus GATT server + LE advertisement, static BLE address via btmgmt). Opt-in via the launcher `Bluetooth: ON/OFF` toggle (`~/usb-gamepad-bt`); requires python-gobject. BT is independent of the USB modes and keeps forwarding when the game is closed. A background bond thread saves the paired PC (address + name) to `~/usb-gamepad-bt-bond`, marks it Trusted and auto-reconnects after reboots; the launcher `Unpair PC` button writes `~/usb-gamepad-bt-unpair`, which makes the daemon call `Adapter1.RemoveDevice` and clear the bond. BLE PnP ID MUST use source byte `0x02` (USB IF) so Windows exposes USB VID/PID `0079:0006` to the HID API (source `0x01` = Bluetooth SIG, which breaks the bridge's VID/PID match).
 - `tests/test_report.py` Ã¢â‚¬â€ run with any Python 3: no pytest needed
   (`python tests/test_report.py`); currently 15 tests, all passing.
 
@@ -113,6 +113,20 @@ Also try filing with Valve referencing this evidence trail.
 
 ## Gotchas learned the hard way (do not regress)
 
+- BLE PnP identity is owned by BlueZ, not the app. BlueZ >=5.50 auto-creates a
+  Device Information service whose PnP ID defaults to Linux Foundation
+  `1D6B:0246` (version = BlueZ's own, e.g. `rev&0553` = 5.53) and Windows reads
+  *that* instead of the app's DIS/PnP, so the Windows bridge can never match
+  `0079:0006` over Bluetooth. Fix: set `DeviceID = usb:0079:0006:0100` under
+  `[General]` in `/etc/bluetooth/main.conf` (source `usb` => PnP source 0x02),
+  restart `bluetooth`, then `usb-gamepad`. Windows caches the PnP ID, so
+  remove+re-pair after changing it. (`DeviceID = false` also works but drops
+  the whole DIS; the installer pins the DeviceID instead.)
+- BLE HID over GATT: `HidD_GetProductString`/`GetManufacturerString` return
+  EMPTY for BLE devices, so the Windows bridge can only match by the PnP ID's
+  USB VID/PID. Also enumerate/query HID handles with access 0 (not
+  `GENERIC_READ`) and open for I/O with `GENERIC_READ|GENERIC_WRITE` first --
+  some BLE HID devices refuse a read-only open.
 - HID mode identity: use the proven generic `0079:0006` ("Valve / Steam Deck
   Gamepad") from deck-usb-hid-controller, plus `protocol`/`subclass`=0 attrs
   and NO device-class attrs. An earlier revision used Valve `28DE:11FF` (the

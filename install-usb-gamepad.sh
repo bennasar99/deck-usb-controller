@@ -52,6 +52,25 @@ else
     exit 1
 fi
 
+# BlueZ (>=5.50) auto-creates a Device Information service whose PnP ID
+# defaults to Linux Foundation 1D6B:0246 (version = BlueZ's own version).
+# Windows reads that PnP ID, so a BLE host sees 1D6B:0246 instead of our
+# 0079:0006 and the Windows bridge cannot match the Deck. Pin the platform
+# DeviceID to our USB identity (source=usb, VID=0079, PID=0006, ver=0100).
+# Best effort: on a fresh SteamOS image main.conf ships the key commented out.
+BT_CONF=/etc/bluetooth/main.conf
+if [ -f "$BT_CONF" ]; then
+    echo "Pinning BlueZ DeviceID to usb:0079:0006:0100 (BLE PnP identity) ..."
+    if grep -qE '^[[:space:]]*#?[[:space:]]*DeviceID[[:space:]]*=' "$BT_CONF"; then
+        sudo sed -i -E 's|^[[:space:]]*#?[[:space:]]*DeviceID[[:space:]]*=.*|DeviceID = usb:0079:0006:0100|' "$BT_CONF"
+    else
+        sudo sed -i '/^\[General\]/a DeviceID = usb:0079:0006:0100' "$BT_CONF"
+    fi
+    sudo systemctl restart bluetooth 2>/dev/null || true
+else
+    echo "WARNING: $BT_CONF not found; Bluetooth PnP ID left at BlueZ default."
+fi
+
 # Run the forwarder as root in the background. Game Mode processes cannot get
 # root (setuid/sudoers are not honoured inside the game session), so the launcher
 # game only keeps a marker file fresh while a systemd service does the root work.
@@ -59,7 +78,9 @@ echo "Installing the root forwarder daemon (systemd service) ..."
 printf '%s\n' \
     '[Unit]' \
     'Description=Steam Deck USB gamepad forwarder daemon' \
-    'After=multi-user.target' \
+    'After=bluetooth.service multi-user.target' \
+    'Wants=bluetooth.service' \
+    'PartOf=bluetooth.service' \
     '' \
     '[Service]' \
     'Type=simple' \

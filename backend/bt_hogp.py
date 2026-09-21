@@ -20,6 +20,7 @@ Implementation notes:
   a brand-new controller after reboots (identity rotation).
 """
 
+import os
 import struct
 import threading
 import time
@@ -65,8 +66,10 @@ UUID_PNP_ID = "00002a50-0000-1000-8000-00805f9b34fb"       # PnP ID
 UUID_REPORT_REF = "00002908-0000-1000-8000-00805f9b34fb"   # Report Reference
 
 # Same identity as the USB gadget so the Windows bridge can match either
-# transport by VID/PID. PnP ID: source=USB(0x01), VID, PID, version.
-PNP_ID_VALUE = bytes([0x01]) + struct.pack("<HHH", 0x0079, 0x0006, 0x0100)
+# transport by VID/PID. PnP ID source byte: 0x01 = Bluetooth SIG-assigned,
+# 0x02 = USB Implementers Forum. It MUST be 0x02 so Windows reports the USB
+# VID/PID (0079:0006) to the HID API instead of a Bluetooth company id.
+PNP_ID_VALUE = bytes([0x02]) + struct.pack("<HHH", 0x0079, 0x0006, 0x0100)
 
 # BLE report map = the same HID descriptor the USB gadget uses (no report
 # IDs, so reports are the raw 12 bytes).
@@ -112,6 +115,21 @@ REPORT_MAP = bytes([
 
 HID_INFORMATION = bytes([0x01, 0x01, 0x00, 0x02])  # bcdHID 1.01, country 0, flags
 ADAPTER = "/org/bluez/hci0"
+DEVICE_IFACE = "org.bluez.Device1"
+ADAPTER_IFACE = "org.bluez.Adapter1"
+
+# Saved bond: first line = PC Bluetooth address, second line = display name.
+# Written when a host pairs, used to auto-reconnect after reboots and as the
+# target of the launcher "Unpair PC" button (which drops a flag file).
+BOND_FILE = "/home/deck/usb-gamepad-bt-bond"
+UNPAIR_FLAG = "/home/deck/usb-gamepad-bt-unpair"
+
+# Deck-initiated reconnection to the saved bond. OFF by default: on some
+# controllers (including the Deck's) initiating a LE connection while
+# advertising tears the advertisement down, so the host loses the HID device.
+# The persisted bond + Trusted flag is enough -- Windows reconnects to a
+# bonded BLE HID device on its own. Set to True only after testing.
+AUTOCONNECT = False
 
 
 class BtHogpError(Exception):
@@ -133,6 +151,7 @@ class BtHogpService:
         self.running = False
         self.polls = 0
         self.errors = 0
+        self.subscribed = False
         self._conn = None
         self._reg_ids = []
         self._adv_id = 0
@@ -140,6 +159,13 @@ class BtHogpService:
         self._loop_thread = None
         self._last_report = bytes(12)
         self._lock = threading.Lock()
+        self.bond_address = ""
+        self.bond_name = ""
+        self._bond_thread = None
+        self._bond_stop = False
+        self._last_connect_try = 0.0
+        self._connect_attempted_for = ""
+        self._was_connected = False
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -148,40 +174,99 @@ class BtHogpService:
             return
         self._ensure_static_address()
         try:
-            self._conn = Gio.bus_get_sync(Gio.BusType.SYSTEM, None, None)
+            self._conn = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
         except GLib.Error as exc:
             raise BtHogpError(f"Cannot connect to the system bus: {exc}") from exc
 
-        self._register_objects()
-        self._start_advertising()
         self.running = True
+        # Run the main loop before registering: BlueZ calls back into our
+        # exported objects (GetManagedObjects / GetAll) while processing
+        # RegisterApplication / RegisterAdvertisement, and those incoming calls
+        # are only dispatched while the loop runs. Registering first makes the
+        # synchronous _call below block until the D-Bus timeout (24).
         self._loop = GLib.MainLoop()
         self._loop_thread = threading.Thread(
             target=self._loop.run, daemon=True, name="bt-hogp-mainloop")
         self._loop_thread.start()
+        try:
+            self._register_objects()
+            # BlueZ only publishes external GATT applications to remote peers
+            # after GattManager1.RegisterApplication; without this the Deck
+            # advertises the HID-service UUID but ATT discovery returns no
+            # services and the pad never works as a gamepad.
+            self._call(BLUEZ, self.adapter, GATT_MANAGER,
+                       "RegisterApplication",
+                       GLib.Variant("(oa{sv})", (ROOT, {})))
+            self._start_advertising()
+        except Exception:
+            # Roll back a half-registered application so a later retry starts
+            # from a clean state instead of leaking objects/connections.
+            try:
+                self.stop()
+            except Exception:
+                pass
+            raise
         self.log("Bluetooth HOGP service started; the Deck is pairable as "
                  f"'{self.name}'.")
+        self._read_bond()
+        if self.bond_address:
+            self.log("Saved Bluetooth PC bond: %s (%s)"
+                     % (self.bond_name or "?", self.bond_address))
+        self._bond_stop = False
+        self._bond_thread = threading.Thread(
+            target=self._bond_loop, daemon=True, name="bt-hogp-bond")
+        self._bond_thread.start()
+
+    def _derive_static_address(self):
+        """Derive a per-unit random static BLE address from /etc/machine-id.
+
+        Random static addresses must have their two most-significant bits set
+        (0b11...). Deriving it per unit avoids the collisions that a single
+        hard-coded address would cause when two Decks are in range.
+        """
+        import hashlib
+        try:
+            with open("/etc/machine-id", "rb") as handle:
+                machine_id = handle.read(32).strip()
+        except OSError:
+            machine_id = b"steamdeck-no-machine-id"
+        digest = hashlib.sha256(machine_id).digest()
+        addr = bytearray(digest[:6])
+        addr[0] |= 0xC0   # top two bits must be 1 for a static random address
+        return ":".join("%02X" % octet for octet in addr)
 
     def _ensure_static_address(self):
-        """Pin a static BLE random address so the Deck keeps its identity
-        across reboots (otherwise address rotation makes Windows treat it as
-        a brand-new controller). Best effort via btmgmt."""
+        """Pin a per-unit random static BLE address so the Deck keeps its
+        identity across reboots (otherwise address rotation makes Windows
+        treat it as a brand-new controller). Best effort via btmgmt."""
         import subprocess
+        target = self._derive_static_address()
         try:
             probe = subprocess.run(["btmgmt", "info"], capture_output=True,
                                    text=True, timeout=5)
-            if "static-addr" in probe.stdout.lower():
+            # `static-addr` appears in BOTH the `supported settings:` and the
+            # `current settings:` lines of `btmgmt info`. Only the *current*
+            # setting means an address is actually loaded, so restrict the
+            # match to that line. (btmgmt's `static-addr` command has no "get"
+            # form -- an address argument is required to set.)
+            current = ""
+            for line in probe.stdout.splitlines():
+                if "current settings" in line:
+                    current = line
+                    break
+            if "static-addr" in current.lower():
                 return   # already configured
             subprocess.run(["btmgmt", "power", "off"], capture_output=True,
                            timeout=5, check=True)
             time.sleep(1)
-            subprocess.run(["btmgmt", "static-addr",
-                            "C2:6C:4A:12:9E:0F"], capture_output=True,
-                           text=True, timeout=5, check=True)
+            subprocess.run(["btmgmt", "static-addr", target],
+                           capture_output=True, text=True, timeout=5,
+                           check=True)
             time.sleep(1)
             subprocess.run(["btmgmt", "power", "on"], capture_output=True,
                            timeout=5)
-            self.log("Static BLE address configured (identity stable).")
+            self.log("Static BLE address configured (%s; identity stable)."
+                     % target)
         except Exception as exc:
             self.log(f"Static BLE address setup skipped: {exc}")
 
@@ -189,6 +274,10 @@ class BtHogpService:
         if not self.running:
             return
         self.running = False
+        self._bond_stop = True
+        if self._bond_thread is not None:
+            self._bond_thread.join(timeout=2.0)
+            self._bond_thread = None
         try:
             if self._adv_id:
                 self._call(BLUEZ, self.adapter, ADV_MANAGER,
@@ -218,6 +307,171 @@ class BtHogpService:
         self._conn = None
         self._configured = False
         self.log("Bluetooth HOGP service stopped.")
+
+    # -- PC bond (persist pairing + auto-reconnect + unpair) -----------------
+
+    def _read_bond(self):
+        try:
+            with open(BOND_FILE, "r") as handle:
+                lines = handle.read().splitlines()
+        except OSError:
+            return
+        if lines and lines[0].strip():
+            self.bond_address = lines[0].strip()
+            self.bond_name = lines[1].strip() if len(lines) > 1 else ""
+
+    def _write_bond(self):
+        try:
+            with open(BOND_FILE, "w") as handle:
+                handle.write("%s\n%s\n" % (self.bond_address or "",
+                                           self.bond_name or ""))
+        except OSError as exc:
+            self.log("Could not save Bluetooth PC bond: %s" % exc)
+
+    def _managed_devices(self):
+        reply = self._conn.call_sync(
+            BLUEZ, "/", OM_IFACE, "GetManagedObjects", None, None,
+            Gio.DBusCallFlags.NONE, 5000, None)
+        objects = reply.unpack()[0]
+        prefix = self.adapter + "/"
+        devices = []
+        for path, ifaces in objects.items():
+            dev = ifaces.get(DEVICE_IFACE)
+            if dev is not None and path.startswith(prefix):
+                devices.append((path, dev))
+        return devices
+
+    @staticmethod
+    def _variant_str(dev, key):
+        value = dev.get(key)
+        try:
+            return value.get_string() if value is not None else ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _variant_bool(dev, key):
+        value = dev.get(key)
+        try:
+            return bool(value.get_boolean()) if value is not None else False
+        except Exception:
+            return False
+
+    def _bond_loop(self):
+        while not self._bond_stop:
+            try:
+                self._refresh_bond()
+            except Exception as exc:
+                self.log("Bluetooth bond poll failed: %s" % exc)
+            for _ in range(20):
+                if self._bond_stop:
+                    break
+                time.sleep(0.1)
+
+    def _refresh_bond(self):
+        if not self.running or self._conn is None:
+            return
+        # "Unpair PC" button in the launcher drops this flag file.
+        if os.path.exists(UNPAIR_FLAG):
+            try:
+                os.remove(UNPAIR_FLAG)
+            except OSError:
+                pass
+            self.unpair()
+            return
+
+        bonded = [(path, dev) for path, dev in self._managed_devices()
+                  if self._variant_bool(dev, "Paired")]
+        if not bonded:
+            return
+
+        chosen = None
+        for path, dev in bonded:
+            if self.bond_address and \
+                    self._variant_str(dev, "Address") == self.bond_address:
+                chosen = (path, dev)
+                break
+        if chosen is None:
+            for path, dev in bonded:
+                if self._variant_bool(dev, "Connected"):
+                    chosen = (path, dev)
+                    break
+        if chosen is None:
+            chosen = bonded[0]
+        path, dev = chosen
+
+        addr = self._variant_str(dev, "Address")
+        name = self._variant_str(dev, "Alias") or self._variant_str(dev, "Name")
+        if addr and (addr != self.bond_address or name != self.bond_name):
+            self.bond_address = addr
+            self.bond_name = name
+            self._write_bond()
+            self.log("Bluetooth PC bond saved: %s (%s)"
+                     % (name or "?", addr))
+
+        # Trust the host so BlueZ accepts its reconnects without re-pairing.
+        if not self._variant_bool(dev, "Trusted"):
+            try:
+                self._call(BLUEZ, path, PROPS_IFACE, "Set",
+                           GLib.Variant("(ssv)", (DEVICE_IFACE, "Trusted",
+                                                  GLib.Variant("b", True))))
+            except Exception:
+                pass
+
+        connected = self._variant_bool(dev, "Connected")
+        if connected and not self._was_connected:
+            self.log("Bluetooth PC connected: %s (%s)"
+                     % (name or "?", addr))
+        self._was_connected = connected
+
+        # Reconnect to the saved bond after a reboot / BT toggle without the
+        # host having to initiate pairing again. Retried every 10 s while
+        # disconnected (a failed attempt just means the PC isn't in range yet).
+        if AUTOCONNECT and not connected and addr and \
+                time.time() - self._last_connect_try >= 10.0:
+            self._last_connect_try = time.time()
+            if self._connect_attempted_for != addr:
+                self._connect_attempted_for = addr
+                self.log("Bluetooth auto-connect requested for %s." % addr)
+            try:
+                self._call(BLUEZ, path, DEVICE_IFACE, "Connect", None)
+            except Exception:
+                pass
+
+    def unpair(self):
+        """Forget the bonded PC in BlueZ and clear the saved bond."""
+        target = self.bond_address
+        removed = []
+        try:
+            devices = self._managed_devices()
+        except Exception as exc:
+            self.log("Unpair failed to list devices: %s" % exc)
+            devices = []
+        for path, dev in devices:
+            if not self._variant_bool(dev, "Paired"):
+                continue
+            addr = self._variant_str(dev, "Address")
+            if target and addr != target:
+                continue
+            try:
+                self._call(BLUEZ, self.adapter, ADAPTER_IFACE, "RemoveDevice",
+                           GLib.Variant("(o)", (path,)))
+                removed.append(addr or path)
+            except Exception as exc:
+                self.log("Unpair failed for %s: %s" % (addr or path, exc))
+        try:
+            os.remove(BOND_FILE)
+        except OSError:
+            pass
+        self.bond_address = ""
+        self.bond_name = ""
+        self._connect_attempted_for = ""
+        self._was_connected = False
+        if removed:
+            self.log("Unpaired Bluetooth PC: %s" % ", ".join(removed))
+        else:
+            self.log("Unpair requested; no matching bonded PC found.")
+        return removed
 
     # -- GATT object registration --------------------------------------------
 
@@ -307,10 +561,10 @@ class BtHogpService:
             "UUID": GLib.Variant("s", UUID_SVC),
             "Primary": GLib.Variant("b", True),
         }
-        def char_props(uuid, flags):
+        def char_props(uuid, flags, service=SVC):
             return {
                 "UUID": GLib.Variant("s", uuid),
-                "Service": GLib.Variant("o", SVC),
+                "Service": GLib.Variant("o", service),
                 "Flags": GLib.Variant("as", flags),
             }
         report_props = char_props(UUID_REPORT, ["read", "notify"])
@@ -334,7 +588,7 @@ class BtHogpService:
                         char_props(UUID_PROTO_MODE,
                                    ["read", "write-without-response"])},
             CHR_PNP_ID: {"org.bluez.GattCharacteristic1":
-                         char_props(UUID_PNP_ID, ["read"])},
+                         char_props(UUID_PNP_ID, ["read"], DIS_SVC)},
             DSC_REPORT_REF: {"org.bluez.GattDescriptor1": {
                 "UUID": GLib.Variant("s", UUID_REPORT_REF),
                 "Characteristic": GLib.Variant("o", CHR_REPORT),
@@ -376,8 +630,14 @@ class BtHogpService:
                 # ignored (no suspend handling; protocol mode is fixed).
                 invocation.return_value(None)
             elif method == "StartNotify":
+                if path == CHR_REPORT:
+                    self.subscribed = True
+                    self.log("Host subscribed to HID reports (CCCD written).")
                 invocation.return_value(None)
             elif method == "StopNotify":
+                if path == CHR_REPORT:
+                    self.subscribed = False
+                    self.log("Host unsubscribed from HID reports.")
                 invocation.return_value(None)
             else:
                 invocation.return_error(
@@ -389,7 +649,11 @@ class BtHogpService:
             if prop_name == "UUID":
                 return GLib.Variant("s", uuid)
             if prop_name == "Service":
-                return GLib.Variant("o", SVC)
+                # The PnP ID characteristic belongs to the Device Information
+                # service; every other characteristic belongs to the HID
+                # service. BlueZ uses this property to build the GATT tree.
+                service = DIS_SVC if path == CHR_PNP_ID else SVC
+                return GLib.Variant("o", service)
             if prop_name == "Flags":
                 return GLib.Variant("as", flags)
             if prop_name == "Value" and path == CHR_REPORT:
@@ -400,7 +664,9 @@ class BtHogpService:
     def _dsc_call(self, connection, sender, path, iface, method, params,
                   invocation):
         if method == "ReadValue":
-            invocation.return_value(GLib.Variant("(ay)", (bytes([0x01, 0x00]),)))
+            # Report Reference = [ReportID, ReportType]. The report map has no
+            # report IDs, so ReportID is 0x00; ReportType is Input (0x01).
+            invocation.return_value(GLib.Variant("(ay)", (bytes([0x00, 0x01]),)))
         else:
             invocation.return_value(None)
 
