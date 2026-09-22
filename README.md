@@ -2,21 +2,33 @@
 
 Turn any **Steam Deck** into a **wired game controller** for a PC connected
 over USB-C. Launch the app from Game Mode as a non-Steam game: a small window
-opens with a **mode selector** (Auto / XInput / HID), and the Deck's sticks,
+opens with a **mode selector** (XInput / HID), and the Deck's sticks,
 triggers, buttons and D-pad are forwarded over the USB link to the host PC.
 
 | Mode | Behavior |
 |------|----------|
-| **Auto** (default) | Native **XInput** (Xbox 360 pad, `045E:028E`) via FunctionFS on Linux hosts; on Windows — which ignores emulated Xbox pads — the app probes, retries once, then switches itself to a **standard USB HID gamepad** (`f_hid`, `/dev/hidg0`) that Steam Input maps for modern games. |
-| **XInput** | Forces the Xbox 360 gadget (FunctionFS). Native XInput on Linux hosts. |
-| **HID** | Forces the standard HID gamepad — pair it with the Windows bridge app (`windows/deck2xinput.exe`, ViGEmBus) for native XInput on Windows. |
-
-| **HID** | Forces the standard HID gamepad — pair it with the Windows bridge app (`windows/deck2xinput.exe`, ViGEmBus) for native XInput on Windows. |
+| **HID** (default) | Standard USB HID gamepad (`f_hid`, `/dev/hidg0`, generic `0079:0006`) — pair it with the Windows bridge app (`windows/deck2xinput.exe`, ViGEmBus) for native XInput on Windows. |
+| **XInput** | Xbox 360 gadget (FunctionFS, `045E:028E`). Native XInput on Linux hosts. |
 | **Bluetooth** (toggle) | Independent of the USB modes: advertises the Deck as a BLE HID gamepad ("SteamDeckPad"). Pair it from the PC's Bluetooth settings — Windows 10+ maps it natively, Steam Input refines it. The paired PC is remembered (`~/usb-gamepad-bt-bond`) and reconnects after reboots; use the window's **Unpair PC** button to forget it. |
 
 The selection is remembered (written to `~/usb-gamepad-mode` and
 `~/usb-gamepad-bt`) and applied immediately — switching takes ~2 s, no
 relaunch needed. Bluetooth runs alongside any USB mode.
+
+> **XInput is USB-only; Bluetooth is always HID.** The XInput/HID selector
+> applies to the USB gadget only — there is no native XInput over Bluetooth.
+> With Bluetooth on, the Deck always advertises the BLE HID gamepad
+> ("SteamDeckPad") regardless of the mode selected. On a **Linux host** that
+> feed is a vendor-defined HID device and there is no Linux bridge, so it does
+> not work as a gamepad over Bluetooth: use **USB + XInput** on Linux.
+
+> **Bluetooth is experimental.** Pairing can be flaky: a host may need to be
+> removed and re-paired, some hosts cache the device identity, and the link is
+> less reliable than USB. Also note the Deck exposes its own **Bluetooth audio
+> (speaker) profile**, so a host may detect/connect it as a speaker in addition
+> to "SteamDeckPad" — remove that audio device on the host. The app disables
+> the Deck's speaker role while the Bluetooth gamepad is active, but it may
+> still be offered before/after.
 
 > Requires the Deck's USB-C port to be in **DRD (Dual Role Device)** mode in
 > the BIOS. See [INSTALL.md](./INSTALL.md).
@@ -36,25 +48,27 @@ Game Mode processes cannot run as root, so the app is split in two:
 
 ### Protocol selection
 
-* **Auto**: XInput starts first. If the host configures the device but never
-  consumes a report (with inputs actively flowing), the daemon re-enumerates
-  once (cable-replug equivalent), then switches permanently (for that session)
-  to HID compatibility mode.
+* **HID** (default): `f_hid` presents a generic gamepad (`0079:0006`) with a
+  vendor-defined top-level usage — invisible to games, consumed only by the
+  Windows bridge — with the D-pad encoded as button bits to avoid host
+  hat-switch heuristics.
 * **XInput**: FunctionFS serves the Xbox 360 pad. A `raw_gadget` backend
   (`backend/xinput_raw.py`, byte-exact emulation incl. vendor descriptors)
   exists and would deliver full XInput to Windows, but current SteamOS
   kernels reject raw_gadget on the Deck's USB-C controller
   (`USB_RAW_IOCTL_RUN` → EBUSY; verified and documented in `AGENTS.md`),
   so it is dormant: opt in with `/opt/usb-gamepad/try-raw`.
-* **HID**: `f_hid` presents a generic gamepad (`0079:0006`) with a
-  vendor-defined top-level usage — invisible to games, consumed only by the
-  Windows bridge — with the D-pad encoded as button bits to avoid host
-  hat-switch heuristics.
 * **Bluetooth**: a BLE HID-over-GATT service (`backend/bt_hogp.py`) presents
   the Deck as a "SteamDeckPad" gamepad over BlueZ (D-Bus GATT server +
   LE advertisement, static BLE address for stable identity). Windows 10+
   pairs with it natively; no bridge or ViGEmBus needed. Requires the
-  `python-gobject` package (installed by the installer).
+  `python-gobject` package (installed by the installer). While it is active
+  the Deck's Bluetooth speaker (A2DP-sink) role is disabled
+  (`backend/bt_audio.py`), so a host does not also pair it as audio; opt out
+  with `~/usb-gamepad-bt-keep-audio`.
+* **Transport priority**: USB wins. While a USB host has the gadget
+  configured, the Bluetooth feed is paused (one neutral report is sent) so
+  the same inputs are never delivered twice.
 
 ## Files
 
@@ -88,10 +102,9 @@ Full guide in [INSTALL.md](./INSTALL.md). Quick start:
 
 1. Connect the Deck to the PC with a data-capable USB-C cable.
 2. Launch the "USB Gamepad" game from your Steam library.
-3. Pick a mode in the window (or stay on **Auto**). The PC sees a controller
-   within seconds on Linux; on Windows expect the ~15 s probe, then a
-   re-enumeration into HID mode (run `windows/deck2xinput.exe` there for
-   native XInput).
+3. Pick a mode in the window (**XInput** on a Linux PC; **HID** for Windows,
+   the default). On Windows run `windows/deck2xinput.exe` there for native
+   XInput.
 4. **OLED burn-in protection**: the window goes fully black after 10 s
    without input. Touch the screen to wake it; forwarding keeps running
    while blacked out.
@@ -108,9 +121,12 @@ Common issues:
   ran. Install `libx11` and re-run the installer.
 - **`No UDC`** — the USB-C port is not in DRD mode. Set **USB Dual Role
   Device** to **DRD** in the BIOS (Volume Up + Power).
-- **`Switching to HID compatibility mode`** on Windows — expected in Auto
-  mode (Windows can't drive emulated Xbox pads through FunctionFS). Wait for
+- **Windows can't see a native Xbox pad** — expected: Windows can't drive
+  emulated Xbox pads through FunctionFS. Use **HID** mode, wait for
   `HID gamepad ready (/dev/hidg0)`, then start `deck2xinput.exe` on the PC.
+- **XInput over Bluetooth does nothing (Linux host)** — expected: XInput is a
+  USB-only gadget and the Bluetooth feed is a vendor-defined HID device with no
+  Linux bridge. Use **USB + XInput** on Linux.
 - **No input anywhere** — the log must show `Reading Microsoft X-Box 360 pad
   0 (...)` and climbing `input_events=`; Steam Input only feeds the virtual
   pad while the game has Game Mode focus.

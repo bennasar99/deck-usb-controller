@@ -21,12 +21,12 @@ Runtime topology (Game Mode processes cannot be root):
    `usb-gamepad.service`): watches the marker; when fresh it brings up the USB
    gadget, reads `/dev/input/event*` and forwards reports to the host.
 
-Protocol selection: the launcher window has three clickable buttons
-(Auto / XInput / HID) that write `/home/deck/usb-gamepad-mode`
-("auto"|"xinput"|"hid"). The daemon polls that file and hot-restarts the
-gadget on change. In "xinput" the auto XInputÃ¢â€ â€™HID watchdog switch is
-disabled (one re-enumeration recovery, then stays). In "auto" the original
-probe-then-switch behavior applies. The daemon reads the file each loop; the
+Protocol selection: the launcher window has two clickable buttons
+(XInput / HID) that write `/home/deck/usb-gamepad-mode`
+("xinput"|"hid"; default "hid"). The daemon polls that file and
+hot-restarts the gadget on change. In "xinput" the watchdog re-enumerates
+once and stays; there is no automatic protocol switch. The daemon reads the
+file each loop; the
 launcher persists the click. NOTE: XButtonEvent x/y coordinates on LP64 are
 at byte offsets 64/68 of the event (read via memcpy from the local XEvent
 padding in usb_gamepad_launcher.c Ã¢â‚¬â€ ev_x/ev_y).
@@ -35,12 +35,12 @@ All logs go to `/home/deck/usb-gamepad.log` (mirrored in journald).
 
 ## Current protocol strategy (implemented, works)
 
-Host capability is detected **behaviorally**, not by querying the host:
+The protocol is chosen by the user in the launcher window (there is no automatic detection):
 
 | Host | Protocol | Detail |
 |------|----------|--------|
 | Linux PCs | Native XInput Ã¢â‚¬â€ Xbox 360 pad (`045E:028E`) via FunctionFS (`f_fs`) | Kernel `xpad` binds and consumes instantly. |
-| Windows PCs | Standard HID gamepad via kernel `f_hid` (`/dev/hidg0`, generic `0079:0006` "Valve / Steam Deck Gamepad" identity, 12-byte report: 15 buttons (incl. D-pad as button bits 11..14, vendor top-level usage 0xFF00) + 2 triggers + 2 sticks) | Switch happens automatically after ~16 s: probe 8 s Ã¢â€ â€™ one UDC re-enumeration Ã¢â€ â€™ switch. Windows cannot drive emulated Xbox pads through FunctionFS (see below); this exact HID identity/descriptor set is field-proven on Windows (verbatim from deck-usb-hid-controller). |
+| Windows PCs | Standard HID gamepad via kernel `f_hid` (`/dev/hidg0`, generic `0079:0006` "Valve / Steam Deck Gamepad" identity, 12-byte report: 15 buttons (incl. D-pad as button bits 11..14, vendor top-level usage 0xFF00) + 2 triggers + 2 sticks) | HID is the default mode; Windows cannot drive emulated Xbox pads through FunctionFS (see below), so run the Windows bridge for native XInput. This exact HID identity/descriptor set is field-proven on Windows. |
 | raw_gadget XInput (`backend/xinput_raw.py`) | Byte-exact Xbox 360 emulation incl. vendor descriptors | **Complete but dormant**: never engages on current SteamOS because the kernel rejects raw_gadget on the physical UDC (see known-problem #1). Auto-activates if that ever changes. |
 
 Key files:
@@ -57,7 +57,7 @@ Key files:
 - `backend/xinput_report.py` / `backend/gamepad_report.py` Ã¢â‚¬â€ wire formats.
 - `backend/controller.py` Ã¢â‚¬â€ `build_xinput_frame` / `build_hid_frame`.
 - `backend/evdev_reader.py` Ã¢â‚¬â€ dependency-free evdev reader.
-- `backend/bt_hogp.py` - BLE HID-over-GATT gamepad (BlueZ D-Bus GATT server + LE advertisement, static BLE address via btmgmt). Opt-in via the launcher `Bluetooth: ON/OFF` toggle (`~/usb-gamepad-bt`); requires python-gobject. BT is independent of the USB modes and keeps forwarding when the game is closed. A background bond thread saves the paired PC (address + name) to `~/usb-gamepad-bt-bond`, marks it Trusted and auto-reconnects after reboots; the launcher `Unpair PC` button writes `~/usb-gamepad-bt-unpair`, which makes the daemon call `Adapter1.RemoveDevice` and clear the bond. BLE PnP ID MUST use source byte `0x02` (USB IF) so Windows exposes USB VID/PID `0079:0006` to the HID API (source `0x01` = Bluetooth SIG, which breaks the bridge's VID/PID match).
+- `backend/bt_hogp.py` - BLE HID-over-GATT gamepad (BlueZ D-Bus GATT server + LE advertisement, static BLE address via btmgmt). Opt-in via the launcher `Bluetooth: ON/OFF` toggle (`~/usb-gamepad-bt`); requires python-gobject. BT is independent of the USB modes and keeps forwarding when the game is closed. A background bond thread saves the paired PC (address + name) to `~/usb-gamepad-bt-bond`, marks it Trusted so the host reconnects to the persisted bond; only a paired, currently-connected device that is not a HID/audio peripheral is taken as the PC (a paired controller/headset is never saved or unpaired as the PC); the launcher `Unpair PC` button writes `~/usb-gamepad-bt-unpair`, which makes the daemon call `Adapter1.RemoveDevice` and clear the bond. BLE PnP ID MUST use source byte `0x02` (USB IF) so Windows exposes USB VID/PID `0079:0006` to the HID API (source `0x01` = Bluetooth SIG, which breaks the bridge's VID/PID match). While the BT service is up the daemon drops the Deck's Bluetooth speaker (A2DP-sink) role via a WirePlumber override (`backend/bt_audio.py`) so pairing the gamepad does not also pair the Deck as a speaker. USB forwarding has priority over Bluetooth: the BLE feed is paused (one neutral report sent) while a USB host has the gadget configured.
 - `tests/test_report.py` Ã¢â‚¬â€ run with any Python 3: no pytest needed
   (`python tests/test_report.py`); currently 15 tests, all passing.
 
@@ -127,6 +127,7 @@ Also try filing with Valve referencing this evidence trail.
   USB VID/PID. Also enumerate/query HID handles with access 0 (not
   `GENERIC_READ`) and open for I/O with `GENERIC_READ|GENERIC_WRITE` first --
   some BLE HID devices refuse a read-only open.
+- SteamOS Bluetooth audio is owned by WirePlumber, not BlueZ: the A2DP-sink (speaker) and headset-AG roles come from the WirePlumber bluez monitor, so BlueZ's `Class`/`DeviceID` do not remove them. To stop the Deck being offered as a speaker while the gamepad is active, `backend/bt_audio.py` writes a user-level override (`~/.config/wireplumber/bluetooth.lua.d/61-usb-gamepad.lua` on WP 0.4, `bluetooth.conf.d/61-usb-gamepad.conf` on 0.5+) setting `bluez5.roles` to `[ a2dp_source ]` and restarts the deck user's wireplumber. Opt out with `~/usb-gamepad-bt-keep-audio`.
 - HID mode identity: use the proven generic `0079:0006` ("Valve / Steam Deck
   Gamepad") from deck-usb-hid-controller, plus `protocol`/`subclass`=0 attrs
   and NO device-class attrs. An earlier revision used Valve `28DE:11FF` (the

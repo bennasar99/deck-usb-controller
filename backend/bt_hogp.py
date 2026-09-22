@@ -124,6 +124,24 @@ ADAPTER_IFACE = "org.bluez.Adapter1"
 BOND_FILE = "/home/deck/usb-gamepad-bt-bond"
 UNPAIR_FLAG = "/home/deck/usb-gamepad-bt-unpair"
 
+# Service UUIDs that mark a paired device as a *peripheral* (HID controller,
+# headset, ...) rather than the host PC we act as a gamepad for. The host is a
+# BLE central connected to our HID service; it advertises none of these. Used
+# to avoid saving (or unpairing!) a controller/headphone as "the PC".
+_PERIPHERAL_UUIDS = {
+    "00001124-0000-1000-8000-00805f9b34fb",   # HID (classic)
+    "00001812-0000-1000-8000-00805f9b34fb",   # HID over GATT
+    "00001108-0000-1000-8000-00805f9b34fb",   # Headset
+    "0000110a-0000-1000-8000-00805f9b34fb",   # Audio Source
+    "0000110b-0000-1000-8000-00805f9b34fb",   # Audio Sink
+    "0000110c-0000-1000-8000-00805f9b34fb",   # A/V Remote Control Target
+    "0000110e-0000-1000-8000-00805f9b34fb",   # A/V Remote Control
+    "00001112-0000-1000-8000-00805f9b34fb",   # Headset AG
+    "0000111e-0000-1000-8000-00805f9b34fb",   # Handsfree
+    "0000111f-0000-1000-8000-00805f9b34fb",   # Handsfree AG
+    "00001203-0000-1000-8000-00805f9b34fb",   # Generic Audio
+}
+
 # Deck-initiated reconnection to the saved bond. OFF by default: on some
 # controllers (including the Deck's) initiating a LE connection while
 # advertising tears the advertisement down, so the host loses the HID device.
@@ -216,6 +234,21 @@ class BtHogpService:
         self._bond_thread = threading.Thread(
             target=self._bond_loop, daemon=True, name="bt-hogp-bond")
         self._bond_thread.start()
+        # Drop the Deck's Bluetooth "speaker" (A2DP-sink) role while we are
+        # the active BLE device, so a host pairing the gamepad does not also
+        # pair the Deck as a speaker.
+        self._set_audio_sink(False)
+
+    def _set_audio_sink(self, enable_speaker):
+        """Best-effort, off-thread: toggle the Deck's BT speaker role."""
+        try:
+            from backend import bt_audio
+        except Exception:
+            return
+        target = (bt_audio.restore_speaker if enable_speaker
+                  else bt_audio.disable_speaker)
+        threading.Thread(target=target, args=(self.log,), daemon=True,
+                         name="bt-audio-role").start()
 
     def _derive_static_address(self):
         """Derive a per-unit random static BLE address from /etc/machine-id.
@@ -278,6 +311,8 @@ class BtHogpService:
         if self._bond_thread is not None:
             self._bond_thread.join(timeout=2.0)
             self._bond_thread = None
+        # Give the Deck its speaker role back now that BT is off.
+        self._set_audio_sink(True)
         try:
             if self._adv_id:
                 self._call(BLUEZ, self.adapter, ADV_MANAGER,
@@ -341,21 +376,50 @@ class BtHogpService:
                 devices.append((path, dev))
         return devices
 
+    # GetManagedObjects is unpacked by GLib.Variant.unpack(), which recursively
+    # unpacks nested variants -- so a property value may arrive either as a
+    # plain Python object (str/bool/int) or as a GLib.Variant depending on the
+    # PyGObject version. Accept both.
     @staticmethod
     def _variant_str(dev, key):
         value = dev.get(key)
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
         try:
-            return value.get_string() if value is not None else ""
+            return value.get_string()
         except Exception:
             return ""
 
     @staticmethod
     def _variant_bool(dev, key):
         value = dev.get(key)
+        if isinstance(value, bool):
+            return value
         try:
-            return bool(value.get_boolean()) if value is not None else False
+            return bool(value.get_boolean())
         except Exception:
             return False
+
+    @staticmethod
+    def _variant_strv(dev, key):
+        value = dev.get(key)
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple)):
+            return [str(item) for item in value]
+        try:
+            return list(value.get_strv())
+        except Exception:
+            return []
+
+    def _is_peripheral(self, dev):
+        """True when the device is a HID/audio peripheral, not our host PC."""
+        for uuid in self._variant_strv(dev, "UUIDs"):
+            if uuid.lower() in _PERIPHERAL_UUIDS:
+                return True
+        return False
 
     def _bond_loop(self):
         while not self._bond_stop:
@@ -380,8 +444,18 @@ class BtHogpService:
             self.unpair()
             return
 
-        bonded = [(path, dev) for path, dev in self._managed_devices()
-                  if self._variant_bool(dev, "Paired")]
+        # Only the BLE HID *host* counts: a paired, currently connected device
+        # that is not itself a peripheral. This stops a paired controller or
+        # headset from being shown/saved as "the PC".
+        bonded = []
+        for path, dev in self._managed_devices():
+            if not self._variant_bool(dev, "Paired"):
+                continue
+            if not self._variant_bool(dev, "Connected"):
+                continue
+            if self._is_peripheral(dev):
+                continue
+            bonded.append((path, dev))
         if not bonded:
             return
 
@@ -391,11 +465,6 @@ class BtHogpService:
                     self._variant_str(dev, "Address") == self.bond_address:
                 chosen = (path, dev)
                 break
-        if chosen is None:
-            for path, dev in bonded:
-                if self._variant_bool(dev, "Connected"):
-                    chosen = (path, dev)
-                    break
         if chosen is None:
             chosen = bonded[0]
         path, dev = chosen
@@ -449,6 +518,9 @@ class BtHogpService:
             devices = []
         for path, dev in devices:
             if not self._variant_bool(dev, "Paired"):
+                continue
+            # Never remove a controller/headset -- only the host PC.
+            if self._is_peripheral(dev):
                 continue
             addr = self._variant_str(dev, "Address")
             if target and addr != target:

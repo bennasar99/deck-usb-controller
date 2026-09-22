@@ -119,8 +119,10 @@ static PVIGEM_CLIENT g_client = nullptr;
 static PVIGEM_TARGET g_pad = nullptr;
 static CRITICAL_SECTION g_feed_cs;      // ViGEmClient is not thread-safe
 static volatile LONG g_forwarded = 0;
+static DWORD g_pad_idle_since = 0;      // tick when the last feed ended
+#define PAD_GRACE_MS 4000               // keep the pad across brief reconnects
 
-static bool VigemStart(void) {
+static bool VigemConnect(void) {
     g_client = vigem_alloc();
     VIGEM_ERROR err = vigem_connect(g_client);
     if (!VIGEM_SUCCESS(err)) {
@@ -128,27 +130,49 @@ static bool VigemStart(void) {
                "installed? (https://vigem.org)\n", err);
         return false;
     }
-    g_pad = vigem_target_x360_alloc();
-    err = vigem_target_add(g_client, g_pad);
-    if (!VIGEM_SUCCESS(err)) {
-        printf("[!] Failed to add virtual Xbox 360 pad: 0x%04X\n", err);
-        return false;
-    }
-    printf("[+] Virtual Xbox 360 controller #%lu created (ViGEmBus).\n",
-           vigem_target_get_index(g_pad));
     return true;
 }
 
-static void VigemStop(void) {
+// The virtual pad is created lazily on the first Deck feed and removed again
+// once no feed is connected (after a short grace period), so an idle bridge
+// leaves no ghost controller on the host. It is reused for reconnects that
+// happen within the grace period, so the host does not see a new controller
+// on every reconnect.
+static bool EnsurePad(void) {
+    bool ok = true;
+    EnterCriticalSection(&g_feed_cs);
+    if (!g_pad) {
+        g_pad = vigem_target_x360_alloc();
+        VIGEM_ERROR err = vigem_target_add(g_client, g_pad);
+        if (!VIGEM_SUCCESS(err)) {
+            printf("[!] Failed to add virtual Xbox 360 pad: 0x%04X\n", err);
+            vigem_target_free(g_pad);
+            g_pad = nullptr;
+            ok = false;
+        } else {
+            printf("[+] Virtual Xbox 360 controller #%lu created (ViGEmBus).\n",
+                   vigem_target_get_index(g_pad));
+        }
+    }
+    LeaveCriticalSection(&g_feed_cs);
+    return ok;
+}
+
+static void RemovePad(void) {
+    EnterCriticalSection(&g_feed_cs);
     if (g_pad) {
         XUSB_REPORT zero{};
-        EnterCriticalSection(&g_feed_cs);
         vigem_target_x360_update(g_client, g_pad, zero);
-        LeaveCriticalSection(&g_feed_cs);
         vigem_target_remove(g_client, g_pad);
         vigem_target_free(g_pad);
         g_pad = nullptr;
+        printf("[-] Virtual Xbox 360 controller removed (no feed).\n");
     }
+    LeaveCriticalSection(&g_feed_cs);
+}
+
+static void VigemShutdown(void) {
+    RemovePad();
     if (g_client) {
         vigem_disconnect(g_client);
         vigem_free(g_client);
@@ -188,6 +212,11 @@ static void FeedReport(const unsigned char *report) {
     }
 
     EnterCriticalSection(&g_feed_cs);
+    if (!g_pad) {
+        // Pad was just torn down (all feeds gone); drop the late report.
+        LeaveCriticalSection(&g_feed_cs);
+        return;
+    }
     VIGEM_ERROR err = vigem_target_x360_update(g_client, g_pad, x);
     LeaveCriticalSection(&g_feed_cs);
     if (!VIGEM_SUCCESS(err)) {
@@ -424,6 +453,16 @@ static void StartSession(const HidDevice &dev) {
     }
     s->h = h;
 
+    if (!EnsurePad()) {
+        printf("[!] Not starting feed %ls: no virtual pad.\n",
+               dev.path.c_str());
+        CloseHandle(s->stopEvent);
+        CloseHandle(s->h);
+        delete s;
+        return;
+    }
+    g_pad_idle_since = 0;
+
     PHIDP_PREPARSED_DATA pp = nullptr;
     HIDP_CAPS caps{};
     if (HidD_GetPreparsedData(h, &pp)) {
@@ -534,11 +573,21 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    // Single instance only: a second bridge would add a second virtual
+    // controller (a ghost) for the same Deck feed.
+    HANDLE singleton = CreateMutexW(nullptr, TRUE, L"deck2xinput_singleton");
+    if (singleton != nullptr && GetLastError() == ERROR_ALREADY_EXISTS) {
+        printf("[!] deck2xinput is already running; exiting so no second "
+               "virtual controller is created.\n");
+        CloseHandle(singleton);
+        return 0;
+    }
+
     InitializeCriticalSection(&g_feed_cs);
     InitializeCriticalSection(&g_sessions_cs);
 
-    if (!VigemStart()) {
-        VigemStop();
+    if (!VigemConnect()) {
+        VigemShutdown();
         DeleteCriticalSection(&g_feed_cs);
         DeleteCriticalSection(&g_sessions_cs);
         return 1;
@@ -577,6 +626,21 @@ int main(int argc, char **argv) {
             LeaveCriticalSection(&g_sessions_cs);
         }
 
+        // Tear the virtual pad down once no feed is connected (after a grace
+        // period), so an idle bridge leaves no ghost controller behind.
+        bool have_feed;
+        EnterCriticalSection(&g_sessions_cs);
+        have_feed = !g_sessions.empty();
+        LeaveCriticalSection(&g_sessions_cs);
+        if (have_feed) {
+            g_pad_idle_since = 0;
+        } else if (g_pad && g_pad_idle_since == 0) {
+            g_pad_idle_since = nowTick;
+        } else if (g_pad && nowTick - g_pad_idle_since >= PAD_GRACE_MS) {
+            RemovePad();
+            g_pad_idle_since = 0;
+        }
+
         // Report stale delivery only while the Deck is actively used — the
         // daemon can't know; the bridge simply notes forward counters.
         if ((LONG)InterlockedAdd(&g_forwarded, 0) != last_forwarded) {
@@ -601,7 +665,7 @@ int main(int argc, char **argv) {
     }
     g_sessions.clear();
 
-    VigemStop();
+    VigemShutdown();
     DeleteCriticalSection(&g_feed_cs);
     DeleteCriticalSection(&g_sessions_cs);
     printf("bye\n");

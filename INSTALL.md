@@ -2,12 +2,12 @@
 
 Turn any Steam Deck into a wired game controller for a PC. While the app is
 running the Deck's controls are forwarded over its USB-C port to the connected
-computer — as a **native Xbox 360 (XInput) controller** where the host accepts
-it, and (after an automatic per-host probe) as a **standard USB HID gamepad**
-elsewhere (the universally supported path, used on Windows). You can also pin
-the protocol manually in the app window. Everything happens in Game Mode: you
-launch a small "fake game" from your library, it opens a window, and the Deck
-becomes a controller. Closing the "game" returns the Deck to normal USB.
+computer as either a **standard USB HID gamepad** (the default; pair it with
+the Windows bridge on a PC for native XInput) or a **native Xbox 360 (XInput)
+controller** (for Linux hosts). You pick the protocol in the app window.
+Everything happens in Game Mode: you launch a small "fake game" from your
+library, it opens a window, and the Deck becomes a controller. Closing the
+"game" returns the Deck to normal USB.
 
 ---
 
@@ -28,10 +28,9 @@ Game Mode processes cannot run as root, so the app is split in two:
 
 | Mode | Behavior |
 |------|----------|
-| **Auto** (default) | Xbox 360 XInput pad first; if the host never consumes reports, one automatic re-enumeration, then a switch to a standard HID gamepad. |
-| **XInput** | Forces the Xbox 360 pad. Native XInput on Linux hosts. |
-| **HID** | Forces a standard USB HID gamepad — the reliable path on Windows; pair with the Windows bridge (see below) for native XInput. |
-| **Bluetooth** (toggle) | Advertises the Deck as a BLE HID gamepad "SteamDeckPad". Pair from the PC's Bluetooth settings; Windows maps it natively (Steam Input refines it). Works alongside any USB mode. |
+| **HID** (default) | Standard USB HID gamepad — the reliable path on Windows; pair with the Windows bridge (see below) for native XInput. |
+| **XInput** | Xbox 360 pad (FunctionFS). Native XInput on Linux hosts. |
+| **Bluetooth** (toggle) | Advertises the Deck as a BLE HID gamepad "SteamDeckPad". Pair from the PC's Bluetooth settings; Windows maps it natively (Steam Input refines it). Works alongside any USB mode. The paired PC is remembered and reconnects after reboots; **Unpair PC** forgets it. |
 
 ---
 
@@ -121,7 +120,7 @@ tail ~/usb-gamepad.log
 ```
 
 Should show `active (running)` and
-`USB XInput controller daemon started ... (mode=auto)`.
+`USB XInput controller daemon started ... (mode=hid)`.
 
 ---
 
@@ -138,16 +137,15 @@ Should show `active (running)` and
 
 1. Connect the Deck to the PC with a data-capable USB-C cable.
 2. Launch the "USB Gamepad" game from your library. The app window shows the
-   status and the three mode buttons (**Auto / XInput / HID**).
+   status and two mode buttons (**XInput / HID**).
 3. Press buttons on the Deck — they should appear on the PC.
 
-What to expect per host:
+What to expect per mode:
 
-| Host | Result |
+| Mode | Result |
 |------|--------|
-| Linux PC | Native **Xbox 360 (XInput)** controller immediately. |
-| Windows PC | First enumerates as an Xbox 360 pad; after the ~15 s probe the app switches to a standard HID gamepad (`Switching to HID compatibility mode` in the log, then `HID gamepad ready`). |
-| Windows PC + bridge | For native XInput on Windows, run the bridge app below; keep the mode on **HID**. |
+| **HID** (default) | Standard USB HID gamepad. On Windows run the bridge app below for native XInput; on Linux it is a raw HID device. |
+| **XInput** | Native **Xbox 360 (XInput)** controller — works directly on Linux hosts; Windows cannot consume it through FunctionFS, so use HID there. |
 
 ---
 
@@ -175,6 +173,12 @@ directly (the gadget is deliberately invisible to games).
 
 ### Alternative: Bluetooth (no cable, no bridge)
 
+> **Experimental.** Bluetooth pairing can be unreliable — a host may need to be
+> removed and re-paired, some hosts cache the device identity, and the link is
+> less reliable than USB. The Deck also exposes its own Bluetooth **audio
+> (speaker)** profile, so a host may detect/connect it as a speaker alongside
+> "SteamDeckPad"; remove that audio device on the host.
+
 Toggle **Bluetooth: ON** in the app window, then on the PC:
 Settings → Bluetooth → connect to **SteamDeckPad** (confirm the pairing pin
 on both devices). Windows 10+ recognizes it as a BLE HID gamepad natively —
@@ -184,6 +188,14 @@ in the game's/Steam's controller settings.
 The paired PC is saved (`~/usb-gamepad-bt-bond`), marked Trusted, and
 reconnects automatically after reboots (no re-pairing). To forget it, click
 **Unpair PC** in the app window — the daemon removes the bond from BlueZ.
+
+While the Bluetooth gamepad is active the Deck's own Bluetooth **speaker**
+(A2DP-sink) role is disabled, so a host does not also pair it as an audio
+device. This is a user-level WirePlumber override and is restored when you
+turn Bluetooth off; opt out with `~/usb-gamepad-bt-keep-audio`.
+
+USB takes priority over Bluetooth: if a USB host is connected while Bluetooth
+is on, the Bluetooth feed is paused so inputs are not sent twice.
 
 ---
 
@@ -203,7 +215,7 @@ host. Triage:
 | Symptom | Fix |
 | --- | --- |
 | `input_events=0` while pressing buttons | Steam Input only feeds its virtual pad while the "USB Gamepad" game has Game Mode focus. Stay focused on the game while testing. |
-| `input_events` climbs, `polls=0` (Windows) | Host isn't consuming XInput — expected on Windows; wait for the automatic switch to HID, or select **HID** mode manually. |
+| `input_events` climbs, `polls=0` | Host isn't consuming the current mode — on Windows select **HID** and run the bridge; on Linux select **XInput**. |
 | `No UDC` / `state=not attached` errors | USB-C port not in DRD mode — fix in BIOS (see Requirements). |
 | Steam loading screen stays forever | `libx11` was missing during install (headless launcher). Install it and re-run the installer. |
 | Mode buttons don't respond | Headless launcher (see above), or taps not reaching the window — re-run the installer with `libx11` installed. |

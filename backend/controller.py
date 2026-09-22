@@ -278,7 +278,7 @@ class GamepadController:
 
 
 def _source_y_sign(reader):
-    """Per-source stick-Y polarity normalizer.
+    """Per-source stick-Y polarity normalizer for the *screen/HID* convention.
 
     The Steam Deck's raw built-in controller (hid-steam) reports stick Y
     with the Steam-controller convention (up = positive), while Steam's
@@ -286,6 +286,10 @@ def _source_y_sign(reader):
     daemon auto-refreshes its source when the current one goes quiet, so
     without this correction the emitted Y polarity would FLIP depending on
     which source was active (observed as the invert "undoing itself").
+
+    Returns the factor that maps a source's normalized Y onto the screen/HID
+    convention (up = negative): the HID frame uses it directly, and
+    build_xinput_frame negates it because XInput is up = positive.
     """
     return -1.0 if getattr(reader, "kind", "") == "deck-builtin" else 1.0
 
@@ -293,16 +297,19 @@ def _source_y_sign(reader):
 def build_xinput_frame(reader, state):
     """Rebuild the 20-byte XInput report from the current evdev state."""
     report = XInputReport()
-    sign = _source_y_sign(reader)
-    _fill_xinput(report, reader, state, sign)
+    # _source_y_sign() yields the screen/HID Y convention (up = negative);
+    # XInput uses up = positive, so negate it here. The Windows bridge reads
+    # the HID frame and applies the same negation (its --invert-y default).
+    _fill_xinput(report, reader, state, -_source_y_sign(reader))
     return report.to_bytes()
 
 
 def build_hid_frame(reader, state):
     """Rebuild the 12-byte HID gamepad report from the current evdev state.
 
-    Used by the HID compatibility gadget (GadgetManager mode 'hid'); the
-    button/D-pad/axis semantics match the XInput path one-to-one.
+    Used by the HID compatibility gadget (GadgetManager mode 'hid'). Buttons,
+    D-pad and triggers match the XInput path; stick Y uses the screen/HID
+    convention (up = negative), which the Windows bridge negates into XInput.
     """
     from backend.gamepad_report import (
         BTN_A as H_A, BTN_B as H_B, BTN_X as H_X, BTN_Y as H_Y,
@@ -377,53 +384,6 @@ def _fill_xinput(report, reader, state, y_sign):
     report.set_trigger(1, _to_trigger(_read_axis(
         reader, state, _pick_axis(reader, evdev_reader.ABS_RZ, evdev_reader.ABS_HAT2X),
         _TRIGGER_DEADZONE)))
-
-
-def build_hid_frame(reader, state):
-    """Rebuild the 13-byte HID gamepad report from the current evdev state.
-
-    Used by the HID compatibility gadget (GadgetManager mode 'hid'); the
-    button/hat/axis semantics match the XInput path one-to-one.
-    """
-    from backend.gamepad_report import (
-        BTN_A as H_A, BTN_B as H_B, BTN_X as H_X, BTN_Y as H_Y,
-        BTN_LB as H_LB, BTN_RB as H_RB,
-        BTN_BACK as H_BACK, BTN_START as H_START,
-        BTN_LS as H_LS, BTN_RS as H_RS, BTN_GUIDE as H_GUIDE,
-        HidGamepadReport,
-    )
-    hid_bits = {
-        A: H_A, B: H_B, X: H_X, Y: H_Y,
-        LB: H_LB, RB: H_RB, BACK: H_BACK, START: H_START,
-        L3: H_LS, R3: H_RS, GUIDE: H_GUIDE,
-    }
-
-    hat_x = state.get(evdev_reader.ABS_HAT0X, 0)
-    hat_y = state.get(evdev_reader.ABS_HAT0Y, 0)
-
-    report = HidGamepadReport()
-    for code, xinput_flag in _BUTTON_MAP.items():
-        hid_flag = hid_bits.get(xinput_flag)
-        if hid_flag is not None and state.get(code):
-            report.set_button(hid_flag, True)
-    report.set_hat(
-        up=hat_y == -1, down=hat_y == 1,
-        left=hat_x == -1, right=hat_x == 1,
-    )
-
-    report.set_stick(0,
-                     _to_stick(_read_axis(reader, state, evdev_reader.ABS_X, _STICK_DEADZONE)),
-                     _to_stick(_read_axis(reader, state, evdev_reader.ABS_Y, _STICK_DEADZONE)))
-    report.set_stick(1,
-                     _to_stick(_read_axis(reader, state, evdev_reader.ABS_RX, _STICK_DEADZONE)),
-                     _to_stick(_read_axis(reader, state, evdev_reader.ABS_RY, _STICK_DEADZONE)))
-    report.set_trigger(0, _to_trigger(_read_axis(
-        reader, state, _pick_axis(reader, evdev_reader.ABS_Z, evdev_reader.ABS_HAT2Y),
-        _TRIGGER_DEADZONE)))
-    report.set_trigger(1, _to_trigger(_read_axis(
-        reader, state, _pick_axis(reader, evdev_reader.ABS_RZ, evdev_reader.ABS_HAT2X),
-        _TRIGGER_DEADZONE)))
-    return report.to_bytes()
 
 
 def _pick_axis(reader, primary, fallback):

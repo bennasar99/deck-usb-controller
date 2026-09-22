@@ -18,8 +18,8 @@ Both can be attached at once — the most recent report wins.
 
 1. **ViGEmBus driver** installed on the PC — grab the latest installer from
    <https://vigem.org> (Downloads → ViGEmBus Setup). Version 1.16 or newer.
-2. The Deck app deployed on the Steam Deck and the Deck connected by USB-C.
-   The app auto-switches to HID mode on Windows after ~15 s; this tool can
+2. The Deck app deployed on the Steam Deck, set to **HID** mode (the default),
+   and the Deck connected by USB-C (or paired over Bluetooth). This tool can
    also be started *before* the Deck is plugged in — it waits for the device.
 
 ## Build
@@ -60,16 +60,20 @@ Options:
 Expected console flow:
 
 ```
-[+] Virtual Xbox 360 controller #1 created (ViGEmBus).
 [*] Waiting for the Deck gamepad (0079:0006)...
-[+] Deck gamepad connected:
-    \\?\hid#vid_0079&pid_0006#...
+[+] Feed connected: \\?\hid#vid_0079&pid_0006#... (hid(0079:0006))
+[+] Virtual Xbox 360 controller #1 created (ViGEmBus).
 [.] 500 reports forwarded...
 ```
 
 Keep it running while you play. On the PC, games see an **Xbox 360
 Controller** (native XInput, glyph-complete). Ctrl+C exits cleanly and
 releases the virtual pad.
+
+The virtual controller is created **lazily** when a Deck feed connects and
+removed ~4 s after it disconnects, so an idle bridge leaves no ghost
+controller. Only one instance runs at a time (a second launch exits with a
+message), and the same virtual controller is reused across quick reconnects.
 
 Run it automatically at login (optional):
 

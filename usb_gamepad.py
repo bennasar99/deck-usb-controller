@@ -41,22 +41,21 @@ LOG_FILE = os.path.join(DECK_HOME, "usb-gamepad.log")
 MARKER_FILE = os.path.join(DECK_HOME, "usb-gamepad-active")
 MARKER_STALE_SECS = 5.0
 # User-selected controller protocol, written by the launcher UI
-# ("auto" | "xinput" | "hid"). "auto" = XInput first, automatic HID
-# fallback when the host ignores it.
+# ("xinput" | "hid"). There is no auto mode: the user picks explicitly.
 MODE_FILE = os.path.join(DECK_HOME, "usb-gamepad-mode")
 BT_FLAG = os.path.join(DECK_HOME, "usb-gamepad-bt")
 
 
 def read_mode():
-    """Read the user-selected mode; 'auto' when absent or unrecognized."""
+    """Read the user-selected protocol; 'hid' when absent or unrecognized."""
     try:
         with open(MODE_FILE, "r") as handle:
             value = handle.read(16).strip().lower()
-        if value in ("auto", "xinput", "hid"):
+        if value in ("xinput", "hid"):
             return value
     except OSError:
         pass
-    return "auto"
+    return "hid"
 
 
 def read_bt_enabled():
@@ -155,13 +154,20 @@ def main():
     resets_done = 0
     hid_recoveries = 0
     applied_wanted = read_mode()      # mode selection applied to the gadget
-    switched_to_hid = False           # auto-mode XInput->HID switch happened
     bt_service = None
     bt_pending = b""
     bt_last = b""
 
     log("USB XInput controller daemon started (build 2026-08-xinput-ffs, "
         "mode=%s); waiting for the 'USB Gamepad' game." % applied_wanted)
+    # If Bluetooth is off, make sure a speaker-role override left behind by a
+    # previous crash is removed (no-op when there is nothing to clean up).
+    if not read_bt_enabled():
+        try:
+            from backend import bt_audio
+            bt_audio.restore_speaker(log)
+        except Exception:
+            pass
     try:
         bt_retry_after = 0.0   # backoff when the BT stack is unavailable
         while not _stop:
@@ -209,8 +215,7 @@ def main():
 
             if not gadget_up:
                 try:
-                    mode = "hid" if (applied_wanted == "hid"
-                                     or switched_to_hid) else "xinput"
+                    mode = applied_wanted
                     log("Setting up USB %s controller..." %
                         ("HID (compatibility)" if mode == "hid"
                          else "Xbox 360 (XInput)"))
@@ -252,14 +257,13 @@ def main():
                 reader = None
                 continue
             now = time.time()
-            # Manual mode selection from the launcher UI: switching between
-            # explicit modes (or back to auto) restarts the gadget.
+            # Mode selection from the launcher UI: switching between XInput
+            # and HID restarts the gadget.
             wanted = read_mode()
             if gadget_up and wanted != applied_wanted:
                 log("Controller mode selection changed: %s -> %s; "
                     "restarting gadget..." % (applied_wanted, wanted))
                 applied_wanted = wanted
-                switched_to_hid = False
                 gadget_up = False
                 reader = None
                 state = {}
@@ -339,10 +343,19 @@ def main():
                 if manager.send_report(pending) == 0:
                     last_frame = pending
 
-            # Bluetooth forwarding (independent of the USB gadget state).
-            if bt_service is not None and bt_pending and bt_pending != bt_last:
-                if bt_service.send_report(bt_pending) == 0:
-                    bt_last = bt_pending
+            # Bluetooth forwarding. Paused while a USB host has the gadget
+            # configured so the same inputs are not delivered over both
+            # transports (USB wins). When USB takes over, one neutral report
+            # releases any buttons the BLE host still sees as held.
+            if bt_service is not None:
+                usb_active = gadget_up and manager.enabled
+                if usb_active:
+                    if bt_last != bytes(12):
+                        bt_service.send_report(bytes(12))
+                        bt_last = bytes(12)
+                elif bt_pending and bt_pending != bt_last:
+                    if bt_service.send_report(bt_pending) == 0:
+                        bt_last = bt_pending
 
             # Watchdog. NOTE: an idle pad freezes polls by design (frames are
             # only written on state change), so "host not consuming" may only
@@ -361,40 +374,10 @@ def main():
                   and now - last_event < 15.0
                   and now - prev_polls_since > 8.0):
                 prev_polls_since = now   # rate-limit recovery to 1 / 8 s
-                if manager.mode == "xinput" and applied_wanted == "auto":
-                    resets_done += 1
-                    if resets_done == 1:
-                        # Host configured us but never consumes reports --
-                        # force ONE re-enumeration (= cable replug).
-                        try:
-                            manager.reset_device()
-                        except Exception as exc:
-                            log("re-enumeration failed: %s" % exc)
-                    else:
-                        # Give up on XInput for this host: switch to a plain
-                        # HID gamepad, which every OS maps out of the box.
-                        log("Host ignored the XInput controller after one "
-                            "re-enumeration; switching to HID compatibility "
-                            "mode. The Deck will now appear as a standard "
-                            "USB gamepad.")
-                        switched_to_hid = True
-                        hid_recoveries = 0
-                        gadget_up = False
-                        reader = None
-                        state = {}
-                        last_frame = b""
-                        pending = b""
-                        delivered_gadget_up = False
-                        prev_polls = 0
-                        try:
-                            manager.stop()
-                        except Exception as exc:
-                            log("teardown during mode switch failed: %s" % exc)
-                        manager = GadgetManager(logger=log, sudo=False)
-                        time.sleep(1.0)
-                elif manager.mode == "xinput":
-                    # User forced XInput: recover once, then stay put â€”
-                    # switching protocols was explicitly disabled.
+                if manager.mode == "xinput":
+                    # XInput delivering nothing while inputs flow: force ONE
+                    # re-enumeration (= cable replug), then stay put. Protocol
+                    # switching is no longer automatic.
                     if resets_done == 0:
                         resets_done = 1
                         try:

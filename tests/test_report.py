@@ -287,6 +287,33 @@ def test_hid_report_descriptor():
     assert ly > 0
 
 
+def test_stick_y_polarity():
+    """XInput is up=positive; the HID frame is up=negative (bridge negates)."""
+    def make(kind, raw_y):
+        reader = _Reader({
+            evdev_reader.ABS_X: {"min": -32768, "max": 32767},
+            evdev_reader.ABS_Y: {"min": -32768, "max": 32767},
+            evdev_reader.ABS_RX: {"min": -32768, "max": 32767},
+            evdev_reader.ABS_RY: {"min": -32768, "max": 32767},
+        })
+        reader.kind = kind
+        state = {evdev_reader.ABS_X: 0, evdev_reader.ABS_Y: raw_y,
+                 evdev_reader.ABS_RX: 0, evdev_reader.ABS_RY: raw_y}
+        return build_xinput_frame(reader, state), build_hid_frame(reader, state)
+
+    # Steam virtual pad / xpad: up is a negative raw value.
+    xf, hf = make("steam-virtual", -32768)
+    assert struct.unpack_from("<h", xf, 8)[0] > 0, "XInput left Y up is positive"
+    assert struct.unpack_from("<h", xf, 12)[0] > 0, "XInput right Y up is positive"
+    assert struct.unpack_from("<h", hf, 6)[0] < 0, "HID left Y up is negative"
+    assert struct.unpack_from("<h", hf, 10)[0] < 0, "HID right Y up is negative"
+
+    # Deck built-in (hid-steam): up is a positive raw value.
+    xf, hf = make("deck-builtin", 32767)
+    assert struct.unpack_from("<h", xf, 8)[0] > 0, "XInput left Y up is positive"
+    assert struct.unpack_from("<h", hf, 6)[0] < 0, "HID left Y up is negative"
+
+
 if __name__ == "__main__":
     tests = [fn for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

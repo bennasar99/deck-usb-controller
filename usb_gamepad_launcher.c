@@ -48,17 +48,16 @@
 #define WIN_W       640
 #define WIN_H       420
 
-enum { MODE_AUTO = 0, MODE_XINPUT = 1, MODE_HID = 2 };
+enum { MODE_XINPUT = 0, MODE_HID = 1 };
 
 static int read_mode(void) {
     FILE *f = fopen(MODE_PATH, "r");
     char buf[16] = {0};
-    int mode = MODE_AUTO;
+    int mode = MODE_HID;   /* default: works with the Windows bridge */
     if (f) {
         if (fgets(buf, sizeof buf, f)) {
             if (strncmp(buf, "xinput", 6) == 0)      mode = MODE_XINPUT;
             else if (strncmp(buf, "hid", 3) == 0)    mode = MODE_HID;
-            else if (strncmp(buf, "auto", 4) == 0)   mode = MODE_AUTO;
         }
         fclose(f);
     }
@@ -69,9 +68,7 @@ static void write_mode(int mode) {
     FILE *f = fopen(MODE_PATH, "w");
     if (!f)
         return;
-    fputs(mode == MODE_XINPUT ? "xinput"
-          : mode == MODE_HID  ? "hid"
-                              : "auto", f);
+    fputs(mode == MODE_XINPUT ? "xinput" : "hid", f);
     fclose(f);
 }
 
@@ -112,28 +109,28 @@ static void trim_eol(char *s) {
         s[--n] = '\0';
 }
 
-/* Build a short label for the saved Bluetooth PC bond. First line of the
- * bond file is the address, the second is the display name. */
+/* Build a label for the saved Bluetooth PC bond. First line of the bond file
+ * is the address, the second is the display name. Always fills `out` so the
+ * window can show "(none)" after a successful unpair. Truncated to fit. */
 static void read_bond_label(char *out, int cap) {
     char addr[64] = {0};
     char name[64] = {0};
     FILE *f = fopen(BOND_PATH, "r");
-    out[0] = '\0';
-    if (!f)
-        return;
-    if (!fgets(addr, sizeof addr, f)) {
+    if (f) {
+        if (!fgets(addr, sizeof addr, f))
+            addr[0] = '\0';
+        if (!fgets(name, sizeof name, f))
+            name[0] = '\0';
         fclose(f);
-        return;
+        trim_eol(addr);
+        trim_eol(name);
     }
-    if (!fgets(name, sizeof name, f))
-        name[0] = '\0';
-    fclose(f);
-    trim_eol(addr);
-    trim_eol(name);
     if (name[0])
-        snprintf(out, cap, "Paired PC: %s", name);
+        snprintf(out, cap, "Paired PC: %.28s", name);
     else if (addr[0])
-        snprintf(out, cap, "Paired PC: %s", addr);
+        snprintf(out, cap, "Paired PC: %.28s", addr);
+    else
+        snprintf(out, cap, "Paired PC: (none)");
 }
 
 static void log_msg(const char *msg);   /* defined below main helpers */
@@ -201,10 +198,9 @@ typedef struct {
     const char *label;
 } UiButton;
 
-static UiButton g_buttons[3] = {
-    { 30, 150, 180, 46, "Auto" },
-    { 230, 150, 180, 46, "XInput" },
-    { 430, 150, 180, 46, "HID" },
+static UiButton g_buttons[2] = {
+    { 40, 150, 260, 46, "XInput" },
+    { 340, 150, 260, 46, "HID" },
 };
 
 /* Forgets the bonded PC in BlueZ via the daemon (writes UNPAIR_PATH). */
@@ -232,11 +228,10 @@ static void draw(void) {
     if (g_font) {
         int mode = read_mode();
         int i;
-        static const char *labels[3] = {"Auto", "XInput", "HID"};
-        static const char *descs[3] = {
-            "Auto: XInput first; falls back to HID when ignored",
+        static const char *labels[2] = {"XInput", "HID"};
+        static const char *descs[2] = {
             "XInput: native on Linux hosts (Windows needs the bridge)",
-            "HID: standard gamepad; pair with the Windows bridge app",
+            "HID: standard gamepad; use the Windows bridge app",
         };
         XSetFont(dpy, gc, g_font);
 
@@ -247,7 +242,7 @@ static void draw(void) {
 
         XSetForeground(dpy, gc, 0xCDD6F4);
         XDrawString(dpy, win, gc, 20, 125, "Controller mode (click):", 23);
-        for (i = 0; i < 3; ++i) {
+        for (i = 0; i < 2; ++i) {
             const int selected = (mode == i);
             const int label_w = slen(labels[i]) * 9;
             XSetForeground(dpy, gc, selected ? 0xA6E3A1 : 0x313244);
@@ -291,11 +286,10 @@ static void draw(void) {
                         g_unpair_btn.x + (g_unpair_btn.w - uw) / 2,
                         g_unpair_btn.y + 28, g_unpair_btn.label,
                         slen(g_unpair_btn.label));
-            if (bond[0]) {
-                XSetForeground(dpy, gc, 0xA6ADB0);
-                XDrawString(dpy, win, gc, 330, g_unpair_btn.y + 28,
-                            bond, slen(bond));
-            }
+            XSetForeground(dpy, gc,
+                           strstr(bond, "(none)") ? 0x6C7086 : 0xA6E3A1);
+            XDrawString(dpy, win, gc, 330, g_unpair_btn.y + 28,
+                        bond, slen(bond));
         }
 
         XSetForeground(dpy, gc, 0x6C7086);
@@ -375,7 +369,7 @@ static void pump_window(void) {
                 const int cx = ev_x(&ev);
                 const int cy = ev_y(&ev);
                 int handled = 0;
-                for (int i = 0; i < 3; ++i) {
+                for (int i = 0; i < 2; ++i) {
                     if (cx >= g_buttons[i].x &&
                         cx < g_buttons[i].x + g_buttons[i].w &&
                         cy >= g_buttons[i].y &&
@@ -384,9 +378,8 @@ static void pump_window(void) {
                         write_mode(i);
                         log_msg(i == MODE_XINPUT ? "usb_gamepad: mode set "
                                   "to XInput (FunctionFS)."
-                                : i == MODE_HID ? "usb_gamepad: mode set "
-                                  "to HID (pair with the Windows bridge)."
-                                : "usb_gamepad: mode set to Auto.");
+                                : "usb_gamepad: mode set to HID "
+                                  "(use the Windows bridge).");
                         handled = 1;
                         break;
                     }
