@@ -1,13 +1,15 @@
 #!/bin/bash
-# Install
-# sudo steamos-readonly disable
-# sudo pacman -Sy --noconfirm libx11 base-devel python-gobject
-# Bluetooth mode additionally uses python-gobject (PyGObject, for the BlueZ
-# D-Bus HOGP service).s the standalone USB gamepad forwarder so it can be launched from
-# Game Mode as a non-Steam game. Run ONCE on the Deck as the deck user:
+# Install the USB gamepad forwarder so it can be launched from Game Mode as a
+# non-Steam game. Run ONCE on the Deck as the deck user:
 #
 #   chmod +x install-usb-gamepad.sh
 #   ./install-usb-gamepad.sh
+#
+# A stock SteamOS needs NO extra packages: the launcher is precompiled
+# (prebuilt/usb_gamepad-x86_64) and SteamOS already ships libX11 and
+# python-gobject. When the prebuilt launcher is absent the script falls back to
+# compiling from source, which needs:
+#   sudo steamos-readonly disable && sudo pacman -Sy base-devel libx11
 #
 # Then add /opt/usb-gamepad/usb_gamepad (the native launcher) to Steam:
 #   Steam -> Add a Game -> Add a Non-Steam Game -> Browse -> /opt/usb-gamepad/usb_gamepad
@@ -17,9 +19,14 @@ APP=/opt/usb-gamepad
 SRC="$(cd "$(dirname "$0")" && pwd)"
 
 echo "Installing USB gamepad app to $APP ..."
-# python-gobject is needed for the Bluetooth (BLE HID-over-GATT) mode.
-sudo pacman -Sy --noconfirm python-gobject >/dev/null 2>&1 || \
-    echo "WARNING: could not install python-gobject; Bluetooth mode disabled."
+# python-gobject is needed for the Bluetooth (BLE HID-over-GATT) mode. SteamOS
+# ships it; only reach for pacman when it is actually missing (that needs the
+# read-only filesystem disabled).
+if ! python3 -c "import gi" >/dev/null 2>&1; then
+    sudo pacman -Sy --noconfirm python-gobject >/dev/null 2>&1 || \
+        echo "WARNING: python-gobject missing and could not be installed; " \
+             "Bluetooth mode disabled."
+fi
 sudo mkdir -p "$APP"
 # Remove any previous payload first: an old backend must never be merged into
 # (or shadowed next to) the current one -- stale modules are how a device can
@@ -34,8 +41,24 @@ echo "Installed backend modules:"
 
 # Compile a native ELF launcher. Steam in Game Mode does not reliably run a
 # bare shell script as a non-Steam game, but a real binary always works.
-echo "Building native launcher ..."
-if command -v gcc >/dev/null 2>&1; then
+echo "Installing native launcher ..."
+# Prefer a prebuilt launcher shipped with the bundle so the Deck needs no
+# compiler or libx11 build files (its root filesystem is read-only by
+# default). Compile from source only when no prebuilt binary is present.
+PREBUILT=""
+for cand in "$SRC/prebuilt/usb_gamepad-x86_64" "$SRC/usb_gamepad-x86_64"; do
+    if [ -f "$cand" ]; then
+        PREBUILT="$cand"
+        break
+    fi
+done
+
+if [ -n "$PREBUILT" ]; then
+    sudo cp "$PREBUILT" "$APP/usb_gamepad"
+    sudo chmod +x "$APP/usb_gamepad"
+    echo "Installed prebuilt launcher ($PREBUILT); no compiler needed."
+    LAUNCHER="$APP/usb_gamepad"
+elif command -v gcc >/dev/null 2>&1; then
     if sudo gcc -O2 -DHAVE_X11 -o "$APP/usb_gamepad" "$APP/usb_gamepad_launcher.c" -l:libX11.so.6; then
         echo "Launcher built with an X11 window (Game Mode will show it)."
     else
@@ -46,7 +69,7 @@ if command -v gcc >/dev/null 2>&1; then
     sudo chmod +x "$APP/usb_gamepad"
     LAUNCHER="$APP/usb_gamepad"
 else
-    echo "ERROR: gcc not found; a native launcher is required."
+    echo "ERROR: no prebuilt launcher and gcc not found; a native launcher is required."
     echo "Install it with:"
     echo "  sudo steamos-readonly disable && sudo pacman -Sy base-devel python-gobject"
     exit 1

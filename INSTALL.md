@@ -39,7 +39,8 @@ Game Mode processes cannot run as root, so the app is split in two:
 - A Steam Deck (LCD or OLED) and a PC with a USB-C or USB-A port.
 - A USB-C cable that supports data (a plain charging cable is not enough).
 - The `deck` user's password (default: `deck`).
-- Internet access on the Deck (to install two packages).
+- Internet access on the Deck only if the prebuilt launcher is missing (then
+  `gcc`/`libx11` must be installed to compile from source).
 - BIOS: **USB Dual Role Device = DRD** (Setup Utility → Advanced → USB
   Configuration; enter with Volume Up + Power).
 
@@ -52,7 +53,12 @@ Either work directly on the Deck (Desktop Mode → Konsole) or over SSH
 
 ---
 
-## Step 1 — Prepare the Deck (read-only filesystem + packages)
+## Step 1 — (Optional) Prepare the Deck to build from source
+
+A stock SteamOS needs **no preparation**: the launcher ships precompiled
+(`prebuilt/usb_gamepad-x86_64`) and SteamOS already provides `libX11` and
+`python-gobject`. Only if that prebuilt binary is missing does the installer
+compile from source, which requires:
 
 ```bash
 sudo steamos-readonly disable
@@ -63,7 +69,8 @@ sudo pacman -Sy --noconfirm libx11 base-devel
 - `libx11` provides the X11 window support so Game Mode shows the app window
   (with the mode buttons) instead of a headless build.
 
-You can re-enable read-only mode afterwards (Step 3).
+Re-enable read-only mode afterwards if you disabled it:
+`sudo steamos-readonly enable`.
 
 ---
 
@@ -90,21 +97,23 @@ chmod +x install-usb-gamepad.sh
 The installer:
 
 1. Copies the app to `/opt/usb-gamepad` (wiping the previous backend first).
-2. Compiles the native launcher (`gcc -O2 -DHAVE_X11 ... -l:libX11.so.6`).
+2. Installs the precompiled launcher (`prebuilt/usb_gamepad-x86_64`); if it is
+   absent it compiles `usb_gamepad_launcher.c` with gcc instead.
 3. Installs and **restarts** the root daemon as a systemd service
    (`usb-gamepad.service`, enabled at boot).
 
 You should see:
 
 ```
-Launcher built with an X11 window (Game Mode will show it).
+Installed prebuilt launcher (.../prebuilt/usb_gamepad-x86_64); no compiler needed.
 Daemon enabled and running. It stays idle until the game is launched.
 ```
 
-If you instead see `WARNING: X11 runtime library not found; building a
-headless launcher`, `libx11` was missing — install it (Step 1) and re-run.
+(When compiling from source instead, the line reads `Launcher built with an
+X11 window (Game Mode will show it).`; a `WARNING: X11 runtime library not
+found` there means `libx11` was missing — install it via Step 1 and re-run.)
 
-You can re-enable read-only mode now:
+If you disabled read-only mode, re-enable it now:
 
 ```bash
 sudo steamos-readonly enable

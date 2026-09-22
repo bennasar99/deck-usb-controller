@@ -85,6 +85,7 @@ Game Mode processes cannot run as root, so the app is split in two:
 | `backend/gamepad_report.py` | HID gamepad descriptor (vendor usage) + 12-byte reports. |
 | `backend/evdev_reader.py` | Pure-Python evdev device reading and discovery. |
 | `windows/` | `deck2xinput.exe` source: HID → ViGEmBus XInput bridge for Windows (ViGEmClient SDK vendored). |
+| `prebuilt/usb_gamepad-x86_64` | Precompiled launcher so Game Mode installs need no compiler. |
 | `tests/test_report.py` | Unit tests (run: `python tests/test_report.py`). |
 | `AGENTS.md` | Repo status, investigation history, gotchas — for humans and agents. |
 
@@ -92,11 +93,12 @@ Game Mode processes cannot run as root, so the app is split in two:
 
 Full guide in [INSTALL.md](./INSTALL.md). Quick start:
 
-1. `sudo steamos-readonly disable`
-2. `sudo pacman -Sy --noconfirm libx11 base-devel`
-3. Copy this folder to the Deck, then run `./install-usb-gamepad.sh`.
-4. Add `/opt/usb-gamepad/usb_gamepad` to Steam as a **Non-Steam Game**.
-5. Launch it from Game Mode while connected to the PC.
+1. Copy this folder to the Deck (the launcher ships **precompiled** — no
+   `gcc`/`libx11` install needed; SteamOS already provides `libX11` and
+   `python-gobject`).
+2. Run `./install-usb-gamepad.sh`.
+3. Add `/opt/usb-gamepad/usb_gamepad` to Steam as a **Non-Steam Game**.
+4. Launch it from Game Mode while connected to the PC.
 
 ## Usage
 
