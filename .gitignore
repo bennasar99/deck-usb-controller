@@ -1,5 +1,5 @@
 backend/out/
-windows/build/
+windows/build*/
 bin/
 *.log
 __pycache__/
